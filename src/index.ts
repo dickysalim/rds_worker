@@ -102,7 +102,7 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE is_active = 1 ORDER BY sku_name',
+    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE is_active = 1 ORDER BY sku_id ASC',
   ).all<ProductRow>()
 
   return json({ products: results })
