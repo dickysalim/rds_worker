@@ -84,6 +84,55 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
   })
 }
 
+async function requireAuth(request: Request, env: Env) {
+  const token = getBearerToken(request)
+  if (!token) return null
+  return verifySession(token, env.JWT_SECRET)
+}
+
+interface ProductRow {
+  sku_id: number
+  sku_name: string
+  unit: string
+  suggested_price: number | null
+  is_active: number
+}
+
+async function handleListProducts(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE is_active = 1 ORDER BY sku_name',
+  ).all<ProductRow>()
+
+  return json({ products: results })
+}
+
+async function handleCreateProduct(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
+    .catch(() => null)
+  if (!body?.sku_name || !body.unit) {
+    return json({ error: 'sku_name and unit are required' }, { status: 400 })
+  }
+
+  const result = await env.DB.prepare(
+    'INSERT INTO product (sku_name, unit, suggested_price) VALUES (?, ?, ?)',
+  )
+    .bind(body.sku_name, body.unit, body.suggested_price ?? null)
+    .run()
+
+  const product = await env.DB.prepare(
+    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE sku_id = ?',
+  )
+    .bind(result.meta.last_row_id)
+    .first<ProductRow>()
+
+  return json({ product }, { status: 201 })
+}
+
 export default {
   async fetch(request, env): Promise<Response> {
     if (request.method === 'OPTIONS') {
@@ -102,6 +151,14 @@ export default {
 
     if (url.pathname === '/auth/me' && request.method === 'GET') {
       return handleMe(request, env)
+    }
+
+    if (url.pathname === '/products' && request.method === 'GET') {
+      return handleListProducts(request, env)
+    }
+
+    if (url.pathname === '/products' && request.method === 'POST') {
+      return handleCreateProduct(request, env)
     }
 
     return json({ error: 'Not found' }, { status: 404 })
