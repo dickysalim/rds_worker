@@ -108,6 +108,28 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   return json({ products: results })
 }
 
+interface CustomerRow {
+  customer_id: number
+  company_name: string
+  address: string | null
+  contact_name: string | null
+  phone_number: string | null
+}
+
+async function handleListCustomers(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT c.customer_id, c.company_name, c.address, cc.contact_name, cc.phone_number
+     FROM customer c
+     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
+     WHERE c.is_active = 1
+     ORDER BY c.customer_id ASC`,
+  ).all<CustomerRow>()
+
+  return json({ customers: results })
+}
+
 function isUniqueConstraintError(err: unknown): boolean {
   return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
 }
@@ -212,6 +234,10 @@ export default {
 
     if (url.pathname === '/auth/me' && request.method === 'GET') {
       return handleMe(request, env)
+    }
+
+    if (url.pathname === '/customers' && request.method === 'GET') {
+      return handleListCustomers(request, env)
     }
 
     if (url.pathname === '/products' && request.method === 'GET') {
