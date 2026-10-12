@@ -134,6 +134,65 @@ function isUniqueConstraintError(err: unknown): boolean {
   return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
 }
 
+async function handleCreateCustomer(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      company_name?: string
+      address?: string | null
+      contact_name?: string
+      phone_number?: string
+    }>()
+    .catch(() => null)
+  if (!body?.company_name || !body.contact_name || !body.phone_number) {
+    return json(
+      { error: 'company_name, contact_name and phone_number are required' },
+      { status: 400 },
+    )
+  }
+
+  let customerId: number
+  try {
+    const result = await env.DB.prepare(
+      'INSERT INTO customer (company_name, address) VALUES (?, ?)',
+    )
+      .bind(body.company_name, body.address ?? null)
+      .run()
+    customerId = result.meta.last_row_id
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A customer with this company name already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  try {
+    await env.DB.prepare(
+      'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, 1)',
+    )
+      .bind(customerId, body.contact_name, body.phone_number)
+      .run()
+  } catch (err) {
+    await env.DB.prepare('DELETE FROM customer WHERE customer_id = ?').bind(customerId).run()
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A contact with this phone number already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  const customer = await env.DB.prepare(
+    `SELECT c.customer_id, c.company_name, c.address, cc.contact_name, cc.phone_number
+     FROM customer c
+     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
+     WHERE c.customer_id = ?`,
+  )
+    .bind(customerId)
+    .first<CustomerRow>()
+
+  return json({ customer }, { status: 201 })
+}
+
 async function handleCreateProduct(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -238,6 +297,10 @@ export default {
 
     if (url.pathname === '/customers' && request.method === 'GET') {
       return handleListCustomers(request, env)
+    }
+
+    if (url.pathname === '/customers' && request.method === 'POST') {
+      return handleCreateCustomer(request, env)
     }
 
     if (url.pathname === '/products' && request.method === 'GET') {
