@@ -193,6 +193,84 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
   return json({ customer }, { status: 201 })
 }
 
+async function handleUpdateCustomer(
+  request: Request,
+  env: Env,
+  customerId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      company_name?: string
+      address?: string | null
+      contact_name?: string
+      phone_number?: string
+    }>()
+    .catch(() => null)
+  if (!body?.company_name || !body.contact_name || !body.phone_number) {
+    return json(
+      { error: 'company_name, contact_name and phone_number are required' },
+      { status: 400 },
+    )
+  }
+
+  try {
+    await env.DB.prepare(
+      'UPDATE customer SET company_name = ?, address = ? WHERE customer_id = ? AND is_active = 1',
+    )
+      .bind(body.company_name, body.address ?? null, customerId)
+      .run()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A customer with this company name already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  try {
+    await env.DB.prepare(
+      'UPDATE customer_contact SET contact_name = ?, phone_number = ? WHERE customer_id = ? AND is_primary = 1 AND is_active = 1',
+    )
+      .bind(body.contact_name, body.phone_number, customerId)
+      .run()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A contact with this phone number already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  const customer = await env.DB.prepare(
+    `SELECT c.customer_id, c.company_name, c.address, cc.contact_name, cc.phone_number
+     FROM customer c
+     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
+     WHERE c.customer_id = ?`,
+  )
+    .bind(customerId)
+    .first<CustomerRow>()
+
+  if (!customer) return json({ error: 'Not found' }, { status: 404 })
+  return json({ customer })
+}
+
+async function handleDeleteCustomer(
+  request: Request,
+  env: Env,
+  customerId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  await env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ?')
+    .bind(customerId)
+    .run()
+  await env.DB.prepare('UPDATE customer_contact SET is_active = 0 WHERE customer_id = ?')
+    .bind(customerId)
+    .run()
+
+  return json({ ok: true })
+}
+
 async function handleCreateProduct(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -301,6 +379,13 @@ export default {
 
     if (url.pathname === '/customers' && request.method === 'POST') {
       return handleCreateCustomer(request, env)
+    }
+
+    const customerMatch = url.pathname.match(/^\/customers\/(\d+)$/)
+    if (customerMatch) {
+      const customerId = Number(customerMatch[1])
+      if (request.method === 'PUT') return handleUpdateCustomer(request, env, customerId)
+      if (request.method === 'DELETE') return handleDeleteCustomer(request, env, customerId)
     }
 
     if (url.pathname === '/products' && request.method === 'GET') {
