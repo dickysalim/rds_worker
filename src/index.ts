@@ -108,6 +108,10 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   return json({ products: results })
 }
 
+function isUniqueConstraintError(err: unknown): boolean {
+  return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
+}
+
 async function handleCreateProduct(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -118,11 +122,19 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
 
-  const result = await env.DB.prepare(
-    'INSERT INTO product (sku_name, unit, suggested_price) VALUES (?, ?, ?)',
-  )
-    .bind(body.sku_name, body.unit, body.suggested_price ?? null)
-    .run()
+  let result
+  try {
+    result = await env.DB.prepare(
+      'INSERT INTO product (sku_name, unit, suggested_price) VALUES (?, ?, ?)',
+    )
+      .bind(body.sku_name, body.unit, body.suggested_price ?? null)
+      .run()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
+    }
+    throw err
+  }
 
   const product = await env.DB.prepare(
     'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE sku_id = ?',
@@ -131,6 +143,55 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
     .first<ProductRow>()
 
   return json({ product }, { status: 201 })
+}
+
+async function handleUpdateProduct(
+  request: Request,
+  env: Env,
+  skuId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
+    .catch(() => null)
+  if (!body?.sku_name || !body.unit) {
+    return json({ error: 'sku_name and unit are required' }, { status: 400 })
+  }
+
+  try {
+    await env.DB.prepare(
+      'UPDATE product SET sku_name = ?, unit = ?, suggested_price = ? WHERE sku_id = ? AND is_active = 1',
+    )
+      .bind(body.sku_name, body.unit, body.suggested_price ?? null, skuId)
+      .run()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  const product = await env.DB.prepare(
+    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE sku_id = ?',
+  )
+    .bind(skuId)
+    .first<ProductRow>()
+
+  if (!product) return json({ error: 'Not found' }, { status: 404 })
+  return json({ product })
+}
+
+async function handleDeleteProduct(
+  request: Request,
+  env: Env,
+  skuId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  await env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ?').bind(skuId).run()
+
+  return json({ ok: true })
 }
 
 export default {
@@ -159,6 +220,13 @@ export default {
 
     if (url.pathname === '/products' && request.method === 'POST') {
       return handleCreateProduct(request, env)
+    }
+
+    const productMatch = url.pathname.match(/^\/products\/(\d+)$/)
+    if (productMatch) {
+      const skuId = Number(productMatch[1])
+      if (request.method === 'PUT') return handleUpdateProduct(request, env, skuId)
+      if (request.method === 'DELETE') return handleDeleteProduct(request, env, skuId)
     }
 
     return json({ error: 'Not found' }, { status: 404 })
