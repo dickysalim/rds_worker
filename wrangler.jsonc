@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rds-worker",
   "main": "src/index.ts",
+  "account_id": "267e5012065fbc8be546ac51f872b0b4",
   "compatibility_date": "2026-10-12",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
