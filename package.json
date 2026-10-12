@@ -1,0 +1,19 @@
+{
+  "name": "rds_worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "cf-typegen": "wrangler types",
+    "db:migrations:create": "wrangler d1 migrations create",
+    "db:migrations:apply:local": "wrangler d1 migrations apply rds_db --local",
+    "db:migrations:apply:remote": "wrangler d1 migrations apply rds_db --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
