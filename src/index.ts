@@ -504,10 +504,88 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
             n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
      FROM nota n
      JOIN nota_summary s ON s.nota_id = n.nota_id
+     WHERE n.is_void = 0
      ORDER BY n.nota_id DESC`,
   ).all<NotaListRow>()
 
   return json({ nota: results })
+}
+
+async function handleVoidNota(request: Request, env: Env, notaId: number): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const result = await env.DB.prepare('UPDATE nota SET is_void = 1 WHERE nota_id = ?')
+    .bind(notaId)
+    .run()
+
+  if (result.meta.changes === 0) return json({ error: 'Nota not found' }, { status: 404 })
+  return json({ ok: true })
+}
+
+interface PaymentRow {
+  payment_id: number
+  payment_date: string
+  amount: number
+  method: string | null
+  reference: string | null
+}
+
+async function handleListPayments(
+  request: Request,
+  env: Env,
+  notaId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT payment_id, payment_date, amount, method, reference
+     FROM payment
+     WHERE nota_id = ? AND is_void = 0
+     ORDER BY payment_date DESC, payment_id DESC`,
+  )
+    .bind(notaId)
+    .all<PaymentRow>()
+
+  return json({ payments: results })
+}
+
+interface CreatePaymentBody {
+  payment_date?: string
+  amount?: number
+  method?: string | null
+  reference?: string | null
+}
+
+async function handleCreatePayment(
+  request: Request,
+  env: Env,
+  notaId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<CreatePaymentBody>().catch(() => null)
+  if (!body?.payment_date || !body.amount || body.amount <= 0) {
+    return json({ error: 'payment_date and a positive amount are required' }, { status: 400 })
+  }
+
+  const nota = await env.DB.prepare('SELECT nota_id FROM nota WHERE nota_id = ? AND is_void = 0')
+    .bind(notaId)
+    .first<{ nota_id: number }>()
+  if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
+
+  const created = await env.DB.prepare(
+    'INSERT INTO payment (nota_id, payment_date, amount, method, reference) VALUES (?, ?, ?, ?, ?)',
+  )
+    .bind(notaId, body.payment_date, body.amount, body.method ?? null, body.reference ?? null)
+    .run()
+
+  const payment = await env.DB.prepare(
+    'SELECT payment_id, payment_date, amount, method, reference FROM payment WHERE payment_id = ?',
+  )
+    .bind(created.meta.last_row_id)
+    .first<PaymentRow>()
+
+  return json({ payment }, { status: 201 })
 }
 
 interface NotaDetailRow {
@@ -842,6 +920,18 @@ export default {
     const notaMatch = url.pathname.match(/^\/nota\/(\d+)$/)
     if (notaMatch && request.method === 'GET') {
       return handleGetNota(request, env, Number(notaMatch[1]))
+    }
+
+    const notaVoidMatch = url.pathname.match(/^\/nota\/(\d+)\/void$/)
+    if (notaVoidMatch && request.method === 'PUT') {
+      return handleVoidNota(request, env, Number(notaVoidMatch[1]))
+    }
+
+    const paymentsMatch = url.pathname.match(/^\/nota\/(\d+)\/payments$/)
+    if (paymentsMatch) {
+      const notaId = Number(paymentsMatch[1])
+      if (request.method === 'GET') return handleListPayments(request, env, notaId)
+      if (request.method === 'POST') return handleCreatePayment(request, env, notaId)
     }
 
     if (url.pathname === '/business' && request.method === 'GET') {
