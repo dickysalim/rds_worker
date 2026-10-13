@@ -510,6 +510,62 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
   return json({ nota: results })
 }
 
+interface NotaDetailRow {
+  nota_id: number
+  nota_number: string
+  nota_date: string
+  customer_company_name_snapshot: string
+  customer_address_snapshot: string | null
+  contact_name_snapshot: string
+  contact_phone_number_snapshot: string
+  total_price: number
+  paid_amount: number
+  status: string
+}
+
+interface NotaItemRow {
+  nota_item_id: number
+  item_name_snapshot: string
+  unit_snapshot: string
+  qty: number
+  price: number
+  discount_amount: number
+  discount_percent: number
+  total_price: number
+}
+
+async function handleGetNota(
+  request: Request,
+  env: Env,
+  notaId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const nota = await env.DB.prepare(
+    `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
+            n.customer_address_snapshot, n.contact_name_snapshot, n.contact_phone_number_snapshot,
+            s.total_price, s.paid_amount, s.status
+     FROM nota n
+     JOIN nota_summary s ON s.nota_id = n.nota_id
+     WHERE n.nota_id = ?`,
+  )
+    .bind(notaId)
+    .first<NotaDetailRow>()
+
+  if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
+
+  const { results: items } = await env.DB.prepare(
+    `SELECT nota_item_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
+     FROM nota_item
+     WHERE nota_id = ?
+     ORDER BY nota_item_id`,
+  )
+    .bind(notaId)
+    .all<NotaItemRow>()
+
+  return json({ nota: { ...nota, items } })
+}
+
 interface NotaItemInput {
   sku_id?: number | null
   sku_name?: string
@@ -781,6 +837,11 @@ export default {
 
     if (url.pathname === '/nota' && request.method === 'POST') {
       return handleCreateNota(request, env)
+    }
+
+    const notaMatch = url.pathname.match(/^\/nota\/(\d+)$/)
+    if (notaMatch && request.method === 'GET') {
+      return handleGetNota(request, env, Number(notaMatch[1]))
     }
 
     if (url.pathname === '/business' && request.method === 'GET') {
