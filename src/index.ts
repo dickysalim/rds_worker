@@ -874,7 +874,16 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   const countRow = await env.DB.prepare('SELECT COUNT(*) AS count FROM nota').first<{
     count: number
   }>()
-  const notaNumber = `NOTA-${String((countRow?.count ?? 0) + 1).padStart(4, '0')}`
+  const customerCountRow = await env.DB.prepare(
+    'SELECT COUNT(*) AS count FROM nota WHERE customer_id = ?',
+  )
+    .bind(customer.customer_id)
+    .first<{ count: number }>()
+
+  const yymm = body.nota_date.slice(2, 4) + body.nota_date.slice(5, 7)
+  const customerSeq = (customerCountRow?.count ?? 0) + 1
+  const globalSeq = (countRow?.count ?? 0) + 1
+  const notaNumber = `INV/${yymm}/${customer.customer_id}-${customerSeq}/${globalSeq}`
 
   const notaResult = await env.DB.prepare(
     `INSERT INTO nota (
