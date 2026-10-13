@@ -1,0 +1,1 @@
+ALTER TABLE nota_item ADD COLUMN discount_percent REAL NOT NULL DEFAULT 0;

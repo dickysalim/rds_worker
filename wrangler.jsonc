@@ -15,5 +15,11 @@
       "database_id": "40ee5539-cafa-49c2-a4cb-a70ced75a37a",
       "migrations_dir": "migrations"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ASSETS",
+      "bucket_name": "rds-factory-management-assets"
+    }
   ]
 }
