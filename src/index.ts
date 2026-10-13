@@ -526,6 +526,7 @@ const PAYMENT_METHODS = ['Cash', 'Bank Transfer', 'QRIS', 'Check', 'Other'] as c
 
 interface PaymentRow {
   payment_id: number
+  payment_number: string | null
   payment_date: string
   amount: number
   method: string | null
@@ -541,7 +542,7 @@ async function handleListPayments(
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT payment_id, payment_date, amount, method, reference, evidence_key
+    `SELECT payment_id, payment_number, payment_date, amount, method, reference, evidence_key
      FROM payment
      WHERE nota_id = ? AND is_void = 0
      ORDER BY payment_date DESC, payment_id DESC`,
@@ -574,19 +575,37 @@ async function handleCreatePayment(
     return json({ error: 'A valid payment method is required' }, { status: 400 })
   }
 
-  const nota = await env.DB.prepare('SELECT nota_id FROM nota WHERE nota_id = ? AND is_void = 0')
+  const nota = await env.DB.prepare(
+    'SELECT nota_id, nota_number FROM nota WHERE nota_id = ? AND is_void = 0',
+  )
     .bind(notaId)
-    .first<{ nota_id: number }>()
+    .first<{ nota_id: number; nota_number: string }>()
   if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
 
-  const created = await env.DB.prepare(
-    'INSERT INTO payment (nota_id, payment_date, amount, method, reference) VALUES (?, ?, ?, ?, ?)',
+  const notaCustomerSegment = nota.nota_number.split('/')[2] ?? String(notaId)
+
+  const notaPaymentCountRow = await env.DB.prepare(
+    'SELECT COUNT(*) AS count FROM payment WHERE nota_id = ?',
   )
-    .bind(notaId, body.payment_date, body.amount, body.method, body.reference ?? null)
+    .bind(notaId)
+    .first<{ count: number }>()
+  const globalPaymentCountRow = await env.DB.prepare('SELECT COUNT(*) AS count FROM payment').first<{
+    count: number
+  }>()
+
+  const yymm = body.payment_date.slice(2, 4) + body.payment_date.slice(5, 7)
+  const paymentSeqForNota = (notaPaymentCountRow?.count ?? 0) + 1
+  const globalPaymentSeq = (globalPaymentCountRow?.count ?? 0) + 1
+  const paymentNumber = `PAY/${yymm}/${notaCustomerSegment}-${paymentSeqForNota}/${globalPaymentSeq}`
+
+  const created = await env.DB.prepare(
+    'INSERT INTO payment (nota_id, payment_number, payment_date, amount, method, reference) VALUES (?, ?, ?, ?, ?, ?)',
+  )
+    .bind(notaId, paymentNumber, body.payment_date, body.amount, body.method, body.reference ?? null)
     .run()
 
   const payment = await env.DB.prepare(
-    'SELECT payment_id, payment_date, amount, method, reference, evidence_key FROM payment WHERE payment_id = ?',
+    'SELECT payment_id, payment_number, payment_date, amount, method, reference, evidence_key FROM payment WHERE payment_id = ?',
   )
     .bind(created.meta.last_row_id)
     .first<PaymentRow>()
