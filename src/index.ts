@@ -522,12 +522,15 @@ async function handleVoidNota(request: Request, env: Env, notaId: number): Promi
   return json({ ok: true })
 }
 
+const PAYMENT_METHODS = ['Cash', 'Bank Transfer', 'QRIS', 'Check', 'Other'] as const
+
 interface PaymentRow {
   payment_id: number
   payment_date: string
   amount: number
   method: string | null
   reference: string | null
+  evidence_key: string | null
 }
 
 async function handleListPayments(
@@ -538,7 +541,7 @@ async function handleListPayments(
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT payment_id, payment_date, amount, method, reference
+    `SELECT payment_id, payment_date, amount, method, reference, evidence_key
      FROM payment
      WHERE nota_id = ? AND is_void = 0
      ORDER BY payment_date DESC, payment_id DESC`,
@@ -552,7 +555,7 @@ async function handleListPayments(
 interface CreatePaymentBody {
   payment_date?: string
   amount?: number
-  method?: string | null
+  method?: string
   reference?: string | null
 }
 
@@ -567,6 +570,9 @@ async function handleCreatePayment(
   if (!body?.payment_date || !body.amount || body.amount <= 0) {
     return json({ error: 'payment_date and a positive amount are required' }, { status: 400 })
   }
+  if (!body.method || !PAYMENT_METHODS.includes(body.method as (typeof PAYMENT_METHODS)[number])) {
+    return json({ error: 'A valid payment method is required' }, { status: 400 })
+  }
 
   const nota = await env.DB.prepare('SELECT nota_id FROM nota WHERE nota_id = ? AND is_void = 0')
     .bind(notaId)
@@ -576,16 +582,82 @@ async function handleCreatePayment(
   const created = await env.DB.prepare(
     'INSERT INTO payment (nota_id, payment_date, amount, method, reference) VALUES (?, ?, ?, ?, ?)',
   )
-    .bind(notaId, body.payment_date, body.amount, body.method ?? null, body.reference ?? null)
+    .bind(notaId, body.payment_date, body.amount, body.method, body.reference ?? null)
     .run()
 
   const payment = await env.DB.prepare(
-    'SELECT payment_id, payment_date, amount, method, reference FROM payment WHERE payment_id = ?',
+    'SELECT payment_id, payment_date, amount, method, reference, evidence_key FROM payment WHERE payment_id = ?',
   )
     .bind(created.meta.last_row_id)
     .first<PaymentRow>()
 
   return json({ payment }, { status: 201 })
+}
+
+const EVIDENCE_CONTENT_TYPES: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'application/pdf': 'pdf',
+}
+
+async function handleUploadPaymentEvidence(
+  request: Request,
+  env: Env,
+  notaId: number,
+  paymentId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const contentType = request.headers.get('Content-Type') ?? ''
+  const ext = EVIDENCE_CONTENT_TYPES[contentType]
+  if (!ext) return json({ error: 'Unsupported file type' }, { status: 400 })
+
+  const payment = await env.DB.prepare(
+    'SELECT payment_id, evidence_key FROM payment WHERE payment_id = ? AND nota_id = ?',
+  )
+    .bind(paymentId, notaId)
+    .first<{ payment_id: number; evidence_key: string | null }>()
+  if (!payment) return json({ error: 'Payment not found' }, { status: 404 })
+
+  const key = `payment-evidence/${paymentId}-${Date.now()}.${ext}`
+  await env.ASSETS.put(key, request.body, { httpMetadata: { contentType } })
+
+  if (payment.evidence_key) {
+    await env.ASSETS.delete(payment.evidence_key).catch(() => {})
+  }
+
+  await env.DB.prepare('UPDATE payment SET evidence_key = ? WHERE payment_id = ?')
+    .bind(key, paymentId)
+    .run()
+
+  return json({ evidence_key: key })
+}
+
+async function handleGetPaymentEvidence(
+  _request: Request,
+  env: Env,
+  notaId: number,
+  paymentId: number,
+): Promise<Response> {
+  const payment = await env.DB.prepare(
+    'SELECT evidence_key FROM payment WHERE payment_id = ? AND nota_id = ?',
+  )
+    .bind(paymentId, notaId)
+    .first<{ evidence_key: string | null }>()
+
+  if (!payment?.evidence_key) return json({ error: 'Not found' }, { status: 404 })
+
+  const object = await env.ASSETS.get(payment.evidence_key)
+  if (!object) return json({ error: 'Not found' }, { status: 404 })
+
+  return new Response(object.body, {
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+      'Cache-Control': 'public, max-age=300',
+    },
+  })
 }
 
 interface NotaDetailRow {
@@ -932,6 +1004,18 @@ export default {
       const notaId = Number(paymentsMatch[1])
       if (request.method === 'GET') return handleListPayments(request, env, notaId)
       if (request.method === 'POST') return handleCreatePayment(request, env, notaId)
+    }
+
+    const paymentEvidenceMatch = url.pathname.match(/^\/nota\/(\d+)\/payments\/(\d+)\/evidence$/)
+    if (paymentEvidenceMatch) {
+      const notaId = Number(paymentEvidenceMatch[1])
+      const paymentId = Number(paymentEvidenceMatch[2])
+      if (request.method === 'PUT') {
+        return handleUploadPaymentEvidence(request, env, notaId, paymentId)
+      }
+      if (request.method === 'GET') {
+        return handleGetPaymentEvidence(request, env, notaId, paymentId)
+      }
     }
 
     if (url.pathname === '/business' && request.method === 'GET') {
