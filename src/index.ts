@@ -522,8 +522,10 @@ interface NotaItemInput {
 
 interface CreateNotaBody {
   nota_date?: string
-  customer_id?: number
-  contact_id?: number
+  company_name?: string
+  company_address?: string | null
+  contact_name?: string
+  phone_number?: string
   items?: NotaItemInput[]
 }
 
@@ -532,26 +534,80 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<CreateNotaBody>().catch(() => null)
-  if (!body?.nota_date || !body.customer_id || !body.contact_id || !body.items?.length) {
+  if (
+    !body?.nota_date ||
+    !body.company_name ||
+    !body.contact_name ||
+    !body.phone_number ||
+    !body.items?.length
+  ) {
     return json(
-      { error: 'nota_date, customer_id, contact_id and at least one item are required' },
+      {
+        error:
+          'nota_date, company_name, contact_name, phone_number and at least one item are required',
+      },
       { status: 400 },
     )
   }
 
-  const customer = await env.DB.prepare(
-    'SELECT customer_id, company_name, address FROM customer WHERE customer_id = ? AND is_active = 1',
+  let customer = await env.DB.prepare(
+    'SELECT customer_id, company_name, address FROM customer WHERE company_name = ? AND is_active = 1',
   )
-    .bind(body.customer_id)
+    .bind(body.company_name)
     .first<{ customer_id: number; company_name: string; address: string | null }>()
-  if (!customer) return json({ error: 'Customer not found' }, { status: 400 })
 
-  const contact = await env.DB.prepare(
-    'SELECT contact_id, contact_name, phone_number FROM customer_contact WHERE contact_id = ? AND customer_id = ? AND is_active = 1',
+  if (!customer) {
+    const created = await env.DB.prepare(
+      'INSERT INTO customer (company_name, address) VALUES (?, ?)',
+    )
+      .bind(body.company_name, body.company_address ?? null)
+      .run()
+    customer = {
+      customer_id: created.meta.last_row_id,
+      company_name: body.company_name,
+      address: body.company_address ?? null,
+    }
+  }
+
+  let contact = await env.DB.prepare(
+    'SELECT contact_id, contact_name, phone_number FROM customer_contact WHERE customer_id = ? AND phone_number = ? AND is_active = 1',
   )
-    .bind(body.contact_id, body.customer_id)
+    .bind(customer.customer_id, body.phone_number)
     .first<{ contact_id: number; contact_name: string; phone_number: string }>()
-  if (!contact) return json({ error: 'Contact not found' }, { status: 400 })
+
+  if (!contact) {
+    const existingContactCount = await env.DB.prepare(
+      'SELECT COUNT(*) AS count FROM customer_contact WHERE customer_id = ? AND is_active = 1',
+    )
+      .bind(customer.customer_id)
+      .first<{ count: number }>()
+
+    try {
+      const created = await env.DB.prepare(
+        'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, ?)',
+      )
+        .bind(
+          customer.customer_id,
+          body.contact_name,
+          body.phone_number,
+          existingContactCount?.count ? 0 : 1,
+        )
+        .run()
+      contact = {
+        contact_id: created.meta.last_row_id,
+        contact_name: body.contact_name,
+        phone_number: body.phone_number,
+      }
+    } catch (err) {
+      if (isUniqueConstraintError(err)) {
+        return json(
+          { error: 'This phone number is already registered to another customer' },
+          { status: 409 },
+        )
+      }
+      throw err
+    }
+  }
 
   const items: Array<{
     sku_id: number
