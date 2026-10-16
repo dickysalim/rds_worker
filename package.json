@@ -9,7 +9,9 @@
     "cf-typegen": "wrangler types",
     "db:migrations:create": "wrangler d1 migrations create",
     "db:migrations:apply:local": "wrangler d1 migrations apply rds_db --local",
-    "db:migrations:apply:remote": "wrangler d1 migrations apply rds_db --remote"
+    "db:migrations:apply:remote": "wrangler d1 migrations apply rds_db --remote",
+    "db:seed:generate": "node scripts/generate-seed.mjs",
+    "db:seed:apply:remote": "wrangler d1 execute rds_factory_management --remote --file=./seed.sql"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261006.1",

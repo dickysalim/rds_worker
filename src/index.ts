@@ -359,16 +359,23 @@ interface BusinessRow {
   business_id: number
   business_name: string
   business_address: string | null
+  business_contact_person: string | null
   business_contact_number: string | null
   business_email: string | null
   business_logo_key: string | null
+  payment_bank_name: string | null
+  payment_account_name: string | null
+  payment_account_number: string | null
 }
+
+const BUSINESS_COLUMNS =
+  'business_id, business_name, business_address, business_contact_person, business_contact_number, business_email, business_logo_key, payment_bank_name, payment_account_name, payment_account_number'
 
 async function handleGetBusiness(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const business = await env.DB.prepare(
-    'SELECT business_id, business_name, business_address, business_contact_number, business_email, business_logo_key FROM business ORDER BY business_id ASC LIMIT 1',
+    `SELECT ${BUSINESS_COLUMNS} FROM business ORDER BY business_id ASC LIMIT 1`,
   ).first<BusinessRow>()
 
   return json({ business })
@@ -381,8 +388,12 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
     .json<{
       business_name?: string
       business_address?: string | null
+      business_contact_person?: string | null
       business_contact_number?: string | null
       business_email?: string | null
+      payment_bank_name?: string | null
+      payment_account_name?: string | null
+      payment_account_number?: string | null
     }>()
     .catch(() => null)
   if (!body?.business_name) {
@@ -395,31 +406,39 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
 
   if (existing) {
     await env.DB.prepare(
-      'UPDATE business SET business_name = ?, business_address = ?, business_contact_number = ?, business_email = ? WHERE business_id = ?',
+      'UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?',
     )
       .bind(
         body.business_name,
         body.business_address ?? null,
+        body.business_contact_person ?? null,
         body.business_contact_number ?? null,
         body.business_email ?? null,
+        body.payment_bank_name ?? null,
+        body.payment_account_name ?? null,
+        body.payment_account_number ?? null,
         existing.business_id,
       )
       .run()
   } else {
     await env.DB.prepare(
-      'INSERT INTO business (business_name, business_address, business_contact_number, business_email) VALUES (?, ?, ?, ?)',
+      'INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     )
       .bind(
         body.business_name,
         body.business_address ?? null,
+        body.business_contact_person ?? null,
         body.business_contact_number ?? null,
         body.business_email ?? null,
+        body.payment_bank_name ?? null,
+        body.payment_account_name ?? null,
+        body.payment_account_number ?? null,
       )
       .run()
   }
 
   const business = await env.DB.prepare(
-    'SELECT business_id, business_name, business_address, business_contact_number, business_email, business_logo_key FROM business ORDER BY business_id ASC LIMIT 1',
+    `SELECT ${BUSINESS_COLUMNS} FROM business ORDER BY business_id ASC LIMIT 1`,
   ).first<BusinessRow>()
 
   return json({ business })
@@ -499,16 +518,35 @@ interface NotaListRow {
 async function handleListNota(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  const { results } = await env.DB.prepare(
-    `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
-            n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
-     FROM nota n
-     JOIN nota_summary s ON s.nota_id = n.nota_id
-     WHERE n.is_void = 0
-     ORDER BY n.nota_id DESC`,
-  ).all<NotaListRow>()
+  const url = new URL(request.url)
+  const limitParam = url.searchParams.get('limit')
+  const offsetParam = url.searchParams.get('offset')
+  const limit = limitParam ? Math.min(Math.max(1, Number(limitParam)), 500) : null
+  const offset = offsetParam ? Math.max(0, Number(offsetParam)) : 0
 
-  return json({ nota: results })
+  const totalRow = await env.DB.prepare(
+    'SELECT COUNT(*) AS count FROM nota WHERE is_void = 0',
+  ).first<{ count: number }>()
+
+  const query = limit
+    ? `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
+              n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
+       FROM nota n
+       JOIN nota_summary s ON s.nota_id = n.nota_id
+       WHERE n.is_void = 0
+       ORDER BY n.nota_id DESC
+       LIMIT ? OFFSET ?`
+    : `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
+              n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
+       FROM nota n
+       JOIN nota_summary s ON s.nota_id = n.nota_id
+       WHERE n.is_void = 0
+       ORDER BY n.nota_id DESC`
+
+  const stmt = limit ? env.DB.prepare(query).bind(limit, offset) : env.DB.prepare(query)
+  const { results } = await stmt.all<NotaListRow>()
+
+  return json({ nota: results, total: totalRow?.count ?? results.length })
 }
 
 async function handleVoidNota(request: Request, env: Env, notaId: number): Promise<Response> {
@@ -795,43 +833,45 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   }
 
   let contact = await env.DB.prepare(
-    'SELECT contact_id, contact_name, phone_number FROM customer_contact WHERE customer_id = ? AND phone_number = ? AND is_active = 1',
+    'SELECT contact_id, contact_name, phone_number FROM customer_contact WHERE customer_id = ? AND is_primary = 1 AND is_active = 1',
   )
-    .bind(customer.customer_id, body.phone_number)
+    .bind(customer.customer_id)
     .first<{ contact_id: number; contact_name: string; phone_number: string }>()
 
-  if (!contact) {
-    const existingContactCount = await env.DB.prepare(
-      'SELECT COUNT(*) AS count FROM customer_contact WHERE customer_id = ? AND is_active = 1',
-    )
-      .bind(customer.customer_id)
-      .first<{ count: number }>()
-
-    try {
-      const created = await env.DB.prepare(
-        'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, ?)',
-      )
-        .bind(
-          customer.customer_id,
-          body.contact_name,
-          body.phone_number,
-          existingContactCount?.count ? 0 : 1,
+  try {
+    if (contact) {
+      if (contact.contact_name !== body.contact_name || contact.phone_number !== body.phone_number) {
+        await env.DB.prepare(
+          'UPDATE customer_contact SET contact_name = ?, phone_number = ? WHERE contact_id = ?',
         )
+          .bind(body.contact_name, body.phone_number, contact.contact_id)
+          .run()
+      }
+      contact = {
+        contact_id: contact.contact_id,
+        contact_name: body.contact_name,
+        phone_number: body.phone_number,
+      }
+    } else {
+      const created = await env.DB.prepare(
+        'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, 1)',
+      )
+        .bind(customer.customer_id, body.contact_name, body.phone_number)
         .run()
       contact = {
         contact_id: created.meta.last_row_id,
         contact_name: body.contact_name,
         phone_number: body.phone_number,
       }
-    } catch (err) {
-      if (isUniqueConstraintError(err)) {
-        return json(
-          { error: 'This phone number is already registered to another customer' },
-          { status: 409 },
-        )
-      }
-      throw err
     }
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json(
+        { error: 'This phone number is already registered to another customer' },
+        { status: 409 },
+      )
+    }
+    throw err
   }
 
   const items: Array<{
