@@ -524,26 +524,52 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
   const limit = limitParam ? Math.min(Math.max(1, Number(limitParam)), 500) : null
   const offset = offsetParam ? Math.max(0, Number(offsetParam)) : 0
 
+  const q = url.searchParams.get('q')?.trim() || null
+  const status = url.searchParams.get('status')?.trim() || null
+  const year = url.searchParams.get('year')?.trim() || null
+  const month = url.searchParams.get('month')?.trim() || null
+
+  const conditions = ['n.is_void = 0']
+  const params: (string | number)[] = []
+
+  if (q) {
+    conditions.push('(n.customer_company_name_snapshot LIKE ? OR n.contact_name_snapshot LIKE ?)')
+    params.push(`%${q}%`, `%${q}%`)
+  }
+  if (status && ['unpaid', 'partial', 'paid', 'void'].includes(status)) {
+    conditions.push('s.status = ?')
+    params.push(status)
+  }
+  if (year && /^\d{4}$/.test(year)) {
+    conditions.push('substr(n.nota_date, 1, 4) = ?')
+    params.push(year)
+  }
+  if (month && /^\d{2}$/.test(month)) {
+    conditions.push('substr(n.nota_date, 6, 2) = ?')
+    params.push(month)
+  }
+
+  const whereClause = conditions.join(' AND ')
+
   const totalRow = await env.DB.prepare(
-    'SELECT COUNT(*) AS count FROM nota WHERE is_void = 0',
-  ).first<{ count: number }>()
+    `SELECT COUNT(*) AS count
+     FROM nota n
+     JOIN nota_summary s ON s.nota_id = n.nota_id
+     WHERE ${whereClause}`,
+  )
+    .bind(...params)
+    .first<{ count: number }>()
 
-  const query = limit
-    ? `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
-              n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
-       FROM nota n
-       JOIN nota_summary s ON s.nota_id = n.nota_id
-       WHERE n.is_void = 0
-       ORDER BY n.nota_id DESC
-       LIMIT ? OFFSET ?`
-    : `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
-              n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
-       FROM nota n
-       JOIN nota_summary s ON s.nota_id = n.nota_id
-       WHERE n.is_void = 0
-       ORDER BY n.nota_id DESC`
+  const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
+            n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
+     FROM nota n
+     JOIN nota_summary s ON s.nota_id = n.nota_id
+     WHERE ${whereClause}
+     ORDER BY n.nota_id DESC`
 
-  const stmt = limit ? env.DB.prepare(query).bind(limit, offset) : env.DB.prepare(query)
+  const stmt = limit
+    ? env.DB.prepare(`${baseQuery} LIMIT ? OFFSET ?`).bind(...params, limit, offset)
+    : env.DB.prepare(baseQuery).bind(...params)
   const { results } = await stmt.all<NotaListRow>()
 
   return json({ nota: results, total: totalRow?.count ?? results.length })
