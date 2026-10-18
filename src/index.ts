@@ -594,6 +594,25 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
   return json({ nota: results, total: totalRow?.count ?? results.length })
 }
 
+async function handleGetNotaDateRange(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const row = await env.DB.prepare(
+    `SELECT MIN(nota_date) AS minDate, MAX(nota_date) AS maxDate FROM nota WHERE is_void = 0`,
+  ).first<{ minDate: string | null; maxDate: string | null }>()
+
+  if (!row?.minDate || !row?.maxDate) {
+    return json({ minYear: null, minMonth: null, maxYear: null, maxMonth: null })
+  }
+
+  return json({
+    minYear: Number(row.minDate.slice(0, 4)),
+    minMonth: Number(row.minDate.slice(5, 7)),
+    maxYear: Number(row.maxDate.slice(0, 4)),
+    maxMonth: Number(row.maxDate.slice(5, 7)),
+  })
+}
+
 async function handleVoidNota(request: Request, env: Env, notaId: number): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -1221,6 +1240,10 @@ export default {
 
     if (url.pathname === '/nota' && request.method === 'POST') {
       return handleCreateNota(request, env)
+    }
+
+    if (url.pathname === '/nota/date-range' && request.method === 'GET') {
+      return handleGetNotaDateRange(request, env)
     }
 
     const notaMatch = url.pathname.match(/^\/nota\/(\d+)$/)
