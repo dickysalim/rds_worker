@@ -508,12 +508,31 @@ interface NotaListRow {
   nota_id: number
   nota_number: string
   nota_date: string
+  customer_id: number
   customer_company_name_snapshot: string
   contact_name_snapshot: string
   total_price: number
   paid_amount: number
   status: string
 }
+
+// Payment is scoped to the bill (customer + month), so every nota in a bill shows the
+// bill's status rather than its own slice of the FIFO allocation in nota_summary.
+const BILL_JOINS = `JOIN nota_summary s ON s.nota_id = n.nota_id
+     LEFT JOIN (
+       SELECT customer_id, substr(nota_date, 1, 7) AS ym, SUM(total_price) AS bill_total
+       FROM nota WHERE is_void = 0 GROUP BY customer_id, substr(nota_date, 1, 7)
+     ) bt ON bt.customer_id = n.customer_id AND bt.ym = substr(n.nota_date, 1, 7)
+     LEFT JOIN (
+       SELECT customer_id, printf('%04d-%02d', bill_year, bill_month) AS ym, SUM(amount) AS bill_paid
+       FROM payment WHERE is_void = 0 GROUP BY customer_id, bill_year, bill_month
+     ) bp ON bp.customer_id = n.customer_id AND bp.ym = substr(n.nota_date, 1, 7)`
+const BILL_STATUS = `CASE
+       WHEN n.is_void = 1 THEN 'void'
+       WHEN COALESCE(bp.bill_paid, 0) >= COALESCE(bt.bill_total, 0) AND COALESCE(bt.bill_total, 0) > 0 THEN 'paid'
+       WHEN COALESCE(bp.bill_paid, 0) > 0 THEN 'partial'
+       ELSE 'unpaid'
+     END`
 
 async function handleListNota(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
@@ -537,7 +556,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
     params.push(`%${q}%`, `%${q}%`)
   }
   if (status && ['unpaid', 'partial', 'paid', 'void'].includes(status)) {
-    conditions.push('s.status = ?')
+    conditions.push(`${BILL_STATUS} = ?`)
     params.push(status)
   }
   if (year && /^\d{4}$/.test(year)) {
@@ -554,16 +573,16 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
   const totalRow = await env.DB.prepare(
     `SELECT COUNT(*) AS count
      FROM nota n
-     JOIN nota_summary s ON s.nota_id = n.nota_id
+     ${BILL_JOINS}
      WHERE ${whereClause}`,
   )
     .bind(...params)
     .first<{ count: number }>()
 
-  const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
-            n.contact_name_snapshot, s.total_price, s.paid_amount, s.status
+  const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_id, n.customer_company_name_snapshot,
+            n.contact_name_snapshot, s.total_price, s.paid_amount, ${BILL_STATUS} AS status
      FROM nota n
-     JOIN nota_summary s ON s.nota_id = n.nota_id
+     ${BILL_JOINS}
      WHERE ${whereClause}
      ORDER BY n.nota_id DESC`
 
@@ -578,11 +597,76 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
 async function handleVoidNota(request: Request, env: Env, notaId: number): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
+  // Best-effort: pdf_r2_key only exists once migration 0013 has been applied.
+  // Voiding the nota must still succeed even if it hasn't been run yet.
+  const existing = await env.DB.prepare('SELECT pdf_r2_key FROM nota WHERE nota_id = ?')
+    .bind(notaId)
+    .first<{ pdf_r2_key: string | null }>()
+    .catch(() => null)
+
   const result = await env.DB.prepare('UPDATE nota SET is_void = 1 WHERE nota_id = ?')
     .bind(notaId)
     .run()
 
   if (result.meta.changes === 0) return json({ error: 'Nota not found' }, { status: 404 })
+
+  if (existing?.pdf_r2_key) {
+    await env.ASSETS.delete(existing.pdf_r2_key).catch(() => {})
+    await env.DB.prepare('UPDATE nota SET pdf_r2_key = NULL WHERE nota_id = ?')
+      .bind(notaId)
+      .run()
+      .catch(() => {})
+  }
+
+  return json({ ok: true })
+}
+
+async function handleClearNotaPdfCache(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  // Logo (or other letterhead data) changed — every cached PDF has the old
+  // one baked in. Just drop the pointers; orphaned R2 objects are harmless
+  // and not worth a bucket listing+delete pass here.
+  await env.DB.prepare('UPDATE nota SET pdf_r2_key = NULL WHERE pdf_r2_key IS NOT NULL').run()
+  return json({ ok: true })
+}
+
+async function handleGetNotaPdf(_request: Request, env: Env, notaId: number): Promise<Response> {
+  const nota = await env.DB.prepare('SELECT pdf_r2_key FROM nota WHERE nota_id = ?')
+    .bind(notaId)
+    .first<{ pdf_r2_key: string | null }>()
+
+  if (!nota?.pdf_r2_key) return json({ error: 'Not cached' }, { status: 404 })
+
+  const object = await env.ASSETS.get(nota.pdf_r2_key)
+  if (!object) return json({ error: 'Not cached' }, { status: 404 })
+
+  return new Response(object.body, {
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type': 'application/pdf',
+      'Cache-Control': 'private, max-age=86400',
+    },
+  })
+}
+
+async function handlePutNotaPdf(request: Request, env: Env, notaId: number): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const nota = await env.DB.prepare('SELECT nota_number, pdf_r2_key FROM nota WHERE nota_id = ?')
+    .bind(notaId)
+    .first<{ nota_number: string; pdf_r2_key: string | null }>()
+  if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
+
+  const key = `nota-pdf/${notaId}-${Date.now()}.pdf`
+  await env.ASSETS.put(key, request.body, { httpMetadata: { contentType: 'application/pdf' } })
+
+  if (nota.pdf_r2_key) {
+    await env.ASSETS.delete(nota.pdf_r2_key).catch(() => {})
+  }
+
+  await env.DB.prepare('UPDATE nota SET pdf_r2_key = ? WHERE nota_id = ?').bind(key, notaId).run()
+
   return json({ ok: true })
 }
 
@@ -596,85 +680,128 @@ interface PaymentRow {
   method: string | null
   reference: string | null
   evidence_key: string | null
+  customer_id: number
+  bill_year: number
+  bill_month: number
+  bill_settled: number
 }
 
-async function handleListPayments(
+// A payment belongs to the bill (customer + month), not a single nota —
+// customer_id/bill_year/bill_month live directly on the row. bill_settled
+// compares the whole bill period's nota total against everything paid.
+const PAYMENT_SELECT = `
+  SELECT p.payment_id, p.payment_number, p.payment_date, p.amount, p.method, p.reference, p.evidence_key,
+    p.customer_id, p.bill_year, p.bill_month,
+    (
+      (SELECT COALESCE(SUM(n.total_price), 0) FROM nota n
+       WHERE n.customer_id = p.customer_id AND n.is_void = 0
+         AND CAST(substr(n.nota_date, 1, 4) AS INTEGER) = p.bill_year
+         AND CAST(substr(n.nota_date, 6, 2) AS INTEGER) = p.bill_month)
+      <=
+      (SELECT COALESCE(SUM(p2.amount), 0) FROM payment p2
+       WHERE p2.customer_id = p.customer_id AND p2.bill_year = p.bill_year
+         AND p2.bill_month = p.bill_month AND p2.is_void = 0)
+    ) AS bill_settled
+  FROM payment p
+`
+
+async function handleListBillPayments(
   request: Request,
   env: Env,
-  notaId: number,
+  customerId: number,
 ): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
+  const url = new URL(request.url)
+  const year = Number(url.searchParams.get('year'))
+  const month = Number(url.searchParams.get('month'))
+  if (!year || !month) return json({ error: 'year and month are required' }, { status: 400 })
+
   const { results } = await env.DB.prepare(
-    `SELECT payment_id, payment_number, payment_date, amount, method, reference, evidence_key
-     FROM payment
-     WHERE nota_id = ? AND is_void = 0
-     ORDER BY payment_date DESC, payment_id DESC`,
+    `${PAYMENT_SELECT} WHERE p.customer_id = ? AND p.bill_year = ? AND p.bill_month = ? AND p.is_void = 0
+     ORDER BY p.payment_date DESC, p.payment_id DESC`,
   )
-    .bind(notaId)
+    .bind(customerId, year, month)
     .all<PaymentRow>()
 
   return json({ payments: results })
 }
 
-interface CreatePaymentBody {
+interface CreateBillPaymentBody {
+  year?: number
+  month?: number
   payment_date?: string
   amount?: number
   method?: string
   reference?: string | null
 }
 
-async function handleCreatePayment(
+// Bill-level payment: the connection point is customer + month (same as the
+// bill number, e.g. BIL/2610/1), not a single nota. Each nota's own
+// paid_amount/status (nota_summary) is a live waterfall allocation across
+// the bill period, computed at read time — not stored per nota here.
+async function handleCreateBillPayment(
   request: Request,
   env: Env,
-  notaId: number,
+  customerId: number,
 ): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  const body = await request.json<CreatePaymentBody>().catch(() => null)
+  const body = await request.json<CreateBillPaymentBody>().catch(() => null)
   if (!body?.payment_date || !body.amount || body.amount <= 0) {
     return json({ error: 'payment_date and a positive amount are required' }, { status: 400 })
   }
   if (!body.method || !PAYMENT_METHODS.includes(body.method as (typeof PAYMENT_METHODS)[number])) {
     return json({ error: 'A valid payment method is required' }, { status: 400 })
   }
+  if (!body.year || !body.month) {
+    return json({ error: 'year and month are required' }, { status: 400 })
+  }
 
-  const nota = await env.DB.prepare(
-    'SELECT nota_id, nota_number FROM nota WHERE nota_id = ? AND is_void = 0',
+  const customer = await env.DB.prepare('SELECT customer_id FROM customer WHERE customer_id = ?')
+    .bind(customerId)
+    .first<{ customer_id: number }>()
+  if (!customer) return json({ error: 'Customer not found' }, { status: 404 })
+
+  const billPaymentCountRow = await env.DB.prepare(
+    'SELECT COUNT(*) AS count FROM payment WHERE customer_id = ? AND bill_year = ? AND bill_month = ? AND is_void = 0',
   )
-    .bind(notaId)
-    .first<{ nota_id: number; nota_number: string }>()
-  if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
-
-  const notaCustomerSegment = nota.nota_number.split('/')[2] ?? String(notaId)
-
-  const notaPaymentCountRow = await env.DB.prepare(
-    'SELECT COUNT(*) AS count FROM payment WHERE nota_id = ?',
-  )
-    .bind(notaId)
+    .bind(customerId, body.year, body.month)
     .first<{ count: number }>()
-  const globalPaymentCountRow = await env.DB.prepare('SELECT COUNT(*) AS count FROM payment').first<{
-    count: number
-  }>()
 
-  const yymm = body.payment_date.slice(2, 4) + body.payment_date.slice(5, 7)
-  const paymentSeqForNota = (notaPaymentCountRow?.count ?? 0) + 1
-  const globalPaymentSeq = (globalPaymentCountRow?.count ?? 0) + 1
-  const paymentNumber = `PAY/${yymm}/${notaCustomerSegment}-${paymentSeqForNota}/${globalPaymentSeq}`
+  const paymentNumber = `PAY/${String(body.year).slice(-2)}${String(body.month).padStart(2, '0')}/${customerId}-${(billPaymentCountRow?.count ?? 0) + 1}`
 
   const created = await env.DB.prepare(
-    'INSERT INTO payment (nota_id, payment_number, payment_date, amount, method, reference) VALUES (?, ?, ?, ?, ?, ?)',
+    'INSERT INTO payment (payment_number, payment_date, amount, method, reference, customer_id, bill_year, bill_month) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(notaId, paymentNumber, body.payment_date, body.amount, body.method, body.reference ?? null)
+    .bind(
+      paymentNumber,
+      body.payment_date,
+      body.amount,
+      body.method,
+      body.reference ?? null,
+      customerId,
+      body.year,
+      body.month,
+    )
     .run()
 
-  const payment = await env.DB.prepare(
-    'SELECT payment_id, payment_number, payment_date, amount, method, reference, evidence_key FROM payment WHERE payment_id = ?',
-  )
+  const payment = await env.DB.prepare(`${PAYMENT_SELECT} WHERE p.payment_id = ?`)
     .bind(created.meta.last_row_id)
     .first<PaymentRow>()
 
   return json({ payment }, { status: 201 })
+}
+
+async function handleVoidPayment(request: Request, env: Env, paymentId: number): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const result = await env.DB.prepare('UPDATE payment SET is_void = 1 WHERE payment_id = ?')
+    .bind(paymentId)
+    .run()
+  if (result.meta.changes === 0) return json({ error: 'Payment not found' }, { status: 404 })
+
+  return json({ ok: true })
 }
 
 const EVIDENCE_CONTENT_TYPES: Record<string, string> = {
@@ -687,7 +814,6 @@ const EVIDENCE_CONTENT_TYPES: Record<string, string> = {
 async function handleUploadPaymentEvidence(
   request: Request,
   env: Env,
-  notaId: number,
   paymentId: number,
 ): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
@@ -696,10 +822,8 @@ async function handleUploadPaymentEvidence(
   const ext = EVIDENCE_CONTENT_TYPES[contentType]
   if (!ext) return json({ error: 'Unsupported file type' }, { status: 400 })
 
-  const payment = await env.DB.prepare(
-    'SELECT payment_id, evidence_key FROM payment WHERE payment_id = ? AND nota_id = ?',
-  )
-    .bind(paymentId, notaId)
+  const payment = await env.DB.prepare('SELECT payment_id, evidence_key FROM payment WHERE payment_id = ?')
+    .bind(paymentId)
     .first<{ payment_id: number; evidence_key: string | null }>()
   if (!payment) return json({ error: 'Payment not found' }, { status: 404 })
 
@@ -720,13 +844,10 @@ async function handleUploadPaymentEvidence(
 async function handleGetPaymentEvidence(
   _request: Request,
   env: Env,
-  notaId: number,
   paymentId: number,
 ): Promise<Response> {
-  const payment = await env.DB.prepare(
-    'SELECT evidence_key FROM payment WHERE payment_id = ? AND nota_id = ?',
-  )
-    .bind(paymentId, notaId)
+  const payment = await env.DB.prepare('SELECT evidence_key FROM payment WHERE payment_id = ?')
+    .bind(paymentId)
     .first<{ evidence_key: string | null }>()
 
   if (!payment?.evidence_key) return json({ error: 'Not found' }, { status: 404 })
@@ -1060,6 +1181,25 @@ export default {
       if (request.method === 'DELETE') return handleDeleteCustomer(request, env, customerId)
     }
 
+    const billPaymentMatch = url.pathname.match(/^\/customers\/(\d+)\/bill-payments$/)
+    if (billPaymentMatch) {
+      const customerId = Number(billPaymentMatch[1])
+      if (request.method === 'GET') return handleListBillPayments(request, env, customerId)
+      if (request.method === 'POST') return handleCreateBillPayment(request, env, customerId)
+    }
+
+    const paymentMatch = url.pathname.match(/^\/payments\/(\d+)$/)
+    if (paymentMatch && request.method === 'DELETE') {
+      return handleVoidPayment(request, env, Number(paymentMatch[1]))
+    }
+
+    const paymentEvidenceMatch2 = url.pathname.match(/^\/payments\/(\d+)\/evidence$/)
+    if (paymentEvidenceMatch2) {
+      const paymentId = Number(paymentEvidenceMatch2[1])
+      if (request.method === 'PUT') return handleUploadPaymentEvidence(request, env, paymentId)
+      if (request.method === 'GET') return handleGetPaymentEvidence(request, env, paymentId)
+    }
+
     if (url.pathname === '/products' && request.method === 'GET') {
       return handleListProducts(request, env)
     }
@@ -1093,24 +1233,17 @@ export default {
       return handleVoidNota(request, env, Number(notaVoidMatch[1]))
     }
 
-    const paymentsMatch = url.pathname.match(/^\/nota\/(\d+)\/payments$/)
-    if (paymentsMatch) {
-      const notaId = Number(paymentsMatch[1])
-      if (request.method === 'GET') return handleListPayments(request, env, notaId)
-      if (request.method === 'POST') return handleCreatePayment(request, env, notaId)
+    if (url.pathname === '/nota/pdf-cache' && request.method === 'DELETE') {
+      return handleClearNotaPdfCache(request, env)
     }
 
-    const paymentEvidenceMatch = url.pathname.match(/^\/nota\/(\d+)\/payments\/(\d+)\/evidence$/)
-    if (paymentEvidenceMatch) {
-      const notaId = Number(paymentEvidenceMatch[1])
-      const paymentId = Number(paymentEvidenceMatch[2])
-      if (request.method === 'PUT') {
-        return handleUploadPaymentEvidence(request, env, notaId, paymentId)
-      }
-      if (request.method === 'GET') {
-        return handleGetPaymentEvidence(request, env, notaId, paymentId)
-      }
+    const notaPdfMatch = url.pathname.match(/^\/nota\/(\d+)\/pdf$/)
+    if (notaPdfMatch) {
+      const notaId = Number(notaPdfMatch[1])
+      if (request.method === 'GET') return handleGetNotaPdf(request, env, notaId)
+      if (request.method === 'PUT') return handlePutNotaPdf(request, env, notaId)
     }
+
 
     if (url.pathname === '/business' && request.method === 'GET') {
       return handleGetBusiness(request, env)
