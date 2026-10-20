@@ -96,14 +96,17 @@ interface ProductRow {
   sku_name: string
   unit: string
   suggested_price: number | null
-  is_active: number
+  updated_by: string | null
+  updated_at: string
 }
+
+const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, updated_by, updated_at'
 
 async function handleListProducts(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE is_active = 1 ORDER BY sku_id ASC',
+    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE is_active = 1 ORDER BY sku_id ASC`,
   ).all<ProductRow>()
 
   return json({ products: results })
@@ -113,20 +116,20 @@ interface CustomerRow {
   customer_id: number
   company_name: string
   address: string | null
-  contact_id: number | null
-  contact_name: string | null
+  contact_person: string | null
   phone_number: string | null
+  updated_by: string | null
+  updated_at: string
 }
+
+const CUSTOMER_COLUMNS =
+  'customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at'
 
 async function handleListCustomers(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT c.customer_id, c.company_name, c.address, cc.contact_id, cc.contact_name, cc.phone_number
-     FROM customer c
-     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
-     WHERE c.is_active = 1
-     ORDER BY c.customer_id ASC`,
+    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE is_active = 1 ORDER BY customer_id ASC`,
   ).all<CustomerRow>()
 
   return json({ customers: results })
@@ -137,19 +140,20 @@ function isUniqueConstraintError(err: unknown): boolean {
 }
 
 async function handleCreateCustomer(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
     .json<{
       company_name?: string
       address?: string | null
-      contact_name?: string
+      contact_person?: string
       phone_number?: string
     }>()
     .catch(() => null)
-  if (!body?.company_name || !body.contact_name || !body.phone_number) {
+  if (!body?.company_name || !body.contact_person || !body.phone_number) {
     return json(
-      { error: 'company_name, contact_name and phone_number are required' },
+      { error: 'company_name, contact_person and phone_number are required' },
       { status: 400 },
     )
   }
@@ -157,37 +161,24 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
   let customerId: number
   try {
     const result = await env.DB.prepare(
-      'INSERT INTO customer (company_name, address) VALUES (?, ?)',
+      `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
+       SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer`,
     )
-      .bind(body.company_name, body.address ?? null)
+      .bind(body.company_name, body.address ?? null, body.contact_person, body.phone_number, session.username)
       .run()
     customerId = result.meta.last_row_id
   } catch (err) {
     if (isUniqueConstraintError(err)) {
-      return json({ error: 'A customer with this company name already exists' }, { status: 409 })
-    }
-    throw err
-  }
-
-  try {
-    await env.DB.prepare(
-      'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, 1)',
-    )
-      .bind(customerId, body.contact_name, body.phone_number)
-      .run()
-  } catch (err) {
-    await env.DB.prepare('DELETE FROM customer WHERE customer_id = ?').bind(customerId).run()
-    if (isUniqueConstraintError(err)) {
-      return json({ error: 'A contact with this phone number already exists' }, { status: 409 })
+      return json(
+        { error: 'A customer with this company name or phone number already exists' },
+        { status: 409 },
+      )
     }
     throw err
   }
 
   const customer = await env.DB.prepare(
-    `SELECT c.customer_id, c.company_name, c.address, cc.contact_id, cc.contact_name, cc.phone_number
-     FROM customer c
-     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
-     WHERE c.customer_id = ?`,
+    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE customer_id = ? AND is_active = 1`,
   )
     .bind(customerId)
     .first<CustomerRow>()
@@ -200,60 +191,75 @@ async function handleUpdateCustomer(
   env: Env,
   customerId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
     .json<{
       company_name?: string
       address?: string | null
-      contact_name?: string
+      contact_person?: string
       phone_number?: string
     }>()
     .catch(() => null)
-  if (!body?.company_name || !body.contact_name || !body.phone_number) {
+  if (!body?.company_name || !body.contact_person || !body.phone_number) {
     return json(
-      { error: 'company_name, contact_name and phone_number are required' },
+      { error: 'company_name, contact_person and phone_number are required' },
       { status: 400 },
     )
   }
 
   try {
-    await env.DB.prepare(
-      'UPDATE customer SET company_name = ?, address = ? WHERE customer_id = ? AND is_active = 1',
-    )
-      .bind(body.company_name, body.address ?? null, customerId)
-      .run()
+    await env.DB.batch([
+      env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1').bind(
+        customerId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
+      ).bind(
+        customerId,
+        body.company_name,
+        body.address ?? null,
+        body.contact_person,
+        body.phone_number,
+        session.username,
+      ),
+    ])
   } catch (err) {
     if (isUniqueConstraintError(err)) {
-      return json({ error: 'A customer with this company name already exists' }, { status: 409 })
-    }
-    throw err
-  }
-
-  try {
-    await env.DB.prepare(
-      'UPDATE customer_contact SET contact_name = ?, phone_number = ? WHERE customer_id = ? AND is_primary = 1 AND is_active = 1',
-    )
-      .bind(body.contact_name, body.phone_number, customerId)
-      .run()
-  } catch (err) {
-    if (isUniqueConstraintError(err)) {
-      return json({ error: 'A contact with this phone number already exists' }, { status: 409 })
+      return json(
+        { error: 'A customer with this company name or phone number already exists' },
+        { status: 409 },
+      )
     }
     throw err
   }
 
   const customer = await env.DB.prepare(
-    `SELECT c.customer_id, c.company_name, c.address, cc.contact_id, cc.contact_name, cc.phone_number
-     FROM customer c
-     LEFT JOIN customer_contact cc ON cc.customer_id = c.customer_id AND cc.is_primary = 1 AND cc.is_active = 1
-     WHERE c.customer_id = ?`,
+    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE customer_id = ? AND is_active = 1`,
   )
     .bind(customerId)
     .first<CustomerRow>()
 
   if (!customer) return json({ error: 'Not found' }, { status: 404 })
   return json({ customer })
+}
+
+async function handleGetCustomerHistory(
+  request: Request,
+  env: Env,
+  customerId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT row_increment, ${CUSTOMER_COLUMNS}, is_active FROM customer WHERE customer_id = ? ORDER BY row_increment DESC`,
+  )
+    .bind(customerId)
+    .all<CustomerRow & { row_increment: number; is_active: number }>()
+
+  return json({ history: results })
 }
 
 async function handleDeleteCustomer(
@@ -263,10 +269,7 @@ async function handleDeleteCustomer(
 ): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  await env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ?')
-    .bind(customerId)
-    .run()
-  await env.DB.prepare('UPDATE customer_contact SET is_active = 0 WHERE customer_id = ?')
+  await env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1')
     .bind(customerId)
     .run()
 
@@ -274,7 +277,8 @@ async function handleDeleteCustomer(
 }
 
 async function handleCreateProduct(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
     .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
@@ -283,13 +287,15 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
 
-  let result
+  let skuId: number
   try {
-    result = await env.DB.prepare(
-      'INSERT INTO product (sku_name, unit, suggested_price) VALUES (?, ?, ?)',
+    const result = await env.DB.prepare(
+      `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
+       SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
     )
-      .bind(body.sku_name, body.unit, body.suggested_price ?? null)
+      .bind(body.sku_name, body.unit, body.suggested_price ?? null, session.username)
       .run()
+    skuId = result.meta.last_row_id
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
@@ -298,9 +304,9 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
   }
 
   const product = await env.DB.prepare(
-    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE sku_id = ?',
+    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE sku_id = ? AND is_active = 1`,
   )
-    .bind(result.meta.last_row_id)
+    .bind(skuId)
     .first<ProductRow>()
 
   return json({ product }, { status: 201 })
@@ -311,7 +317,8 @@ async function handleUpdateProduct(
   env: Env,
   skuId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
     .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
@@ -321,11 +328,15 @@ async function handleUpdateProduct(
   }
 
   try {
-    await env.DB.prepare(
-      'UPDATE product SET sku_name = ?, unit = ?, suggested_price = ? WHERE sku_id = ? AND is_active = 1',
-    )
-      .bind(body.sku_name, body.unit, body.suggested_price ?? null, skuId)
-      .run()
+    await env.DB.batch([
+      env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ? AND is_active = 1').bind(
+        skuId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
+      ).bind(skuId, body.sku_name, body.unit, body.suggested_price ?? null, session.username),
+    ])
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
@@ -334,13 +345,29 @@ async function handleUpdateProduct(
   }
 
   const product = await env.DB.prepare(
-    'SELECT sku_id, sku_name, unit, suggested_price, is_active FROM product WHERE sku_id = ?',
+    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE sku_id = ? AND is_active = 1`,
   )
     .bind(skuId)
     .first<ProductRow>()
 
   if (!product) return json({ error: 'Not found' }, { status: 404 })
   return json({ product })
+}
+
+async function handleGetProductHistory(
+  request: Request,
+  env: Env,
+  skuId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT row_increment, ${PRODUCT_COLUMNS}, is_active FROM product WHERE sku_id = ? ORDER BY row_increment DESC`,
+  )
+    .bind(skuId)
+    .all<ProductRow & { row_increment: number; is_active: number }>()
+
+  return json({ history: results })
 }
 
 async function handleDeleteProduct(
@@ -350,7 +377,9 @@ async function handleDeleteProduct(
 ): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  await env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ?').bind(skuId).run()
+  await env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ? AND is_active = 1')
+    .bind(skuId)
+    .run()
 
   return json({ ok: true })
 }
@@ -545,27 +574,41 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
 
   const q = url.searchParams.get('q')?.trim() || null
   const status = url.searchParams.get('status')?.trim() || null
-  const year = url.searchParams.get('year')?.trim() || null
-  const month = url.searchParams.get('month')?.trim() || null
+  const startDate = url.searchParams.get('start_date')?.trim() || null
+  const endDate = url.searchParams.get('end_date')?.trim() || null
 
   const conditions = ['n.is_void = 0']
   const params: (string | number)[] = []
 
   if (q) {
-    conditions.push('(n.customer_company_name_snapshot LIKE ? OR n.contact_name_snapshot LIKE ?)')
-    params.push(`%${q}%`, `%${q}%`)
+    const orParts = [
+      'n.customer_company_name_snapshot LIKE ?',
+      'n.contact_name_snapshot LIKE ?',
+      'n.nota_number LIKE ?',
+    ]
+    const orParams: (string | number)[] = [`%${q}%`, `%${q}%`, `%${q}%`]
+    if (/^\d+$/.test(q)) {
+      // Bare digits also match the nota's trailing global sequence number
+      // (nota_number ends "/<seq>") and the bill's total price.
+      orParts.push('n.nota_number LIKE ?')
+      orParams.push(`%/${q}`)
+      orParts.push('CAST(s.total_price AS TEXT) LIKE ?')
+      orParams.push(`%${q}%`)
+    }
+    conditions.push(`(${orParts.join(' OR ')})`)
+    params.push(...orParams)
   }
   if (status && ['unpaid', 'partial', 'paid', 'void'].includes(status)) {
     conditions.push(`${BILL_STATUS} = ?`)
     params.push(status)
   }
-  if (year && /^\d{4}$/.test(year)) {
-    conditions.push('substr(n.nota_date, 1, 4) = ?')
-    params.push(year)
+  if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+    conditions.push('n.nota_date >= ?')
+    params.push(startDate)
   }
-  if (month && /^\d{2}$/.test(month)) {
-    conditions.push('substr(n.nota_date, 6, 2) = ?')
-    params.push(month)
+  if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    conditions.push('n.nota_date <= ?')
+    params.push(endDate)
   }
 
   const whereClause = conditions.join(' AND ')
@@ -584,7 +627,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
      FROM nota n
      ${BILL_JOINS}
      WHERE ${whereClause}
-     ORDER BY n.nota_id DESC`
+     ORDER BY n.nota_date DESC, n.nota_id DESC`
 
   const stmt = limit
     ? env.DB.prepare(`${baseQuery} LIMIT ? OFFSET ?`).bind(...params, limit, offset)
@@ -689,7 +732,7 @@ async function handlePutNotaPdf(request: Request, env: Env, notaId: number): Pro
   return json({ ok: true })
 }
 
-const PAYMENT_METHODS = ['Cash', 'Bank Transfer', 'QRIS', 'Check', 'Other'] as const
+const PAYMENT_METHODS = ['Cash', 'Bank Transfer', 'QRIS', 'Giro', 'Other'] as const
 
 interface PaymentRow {
   payment_id: number
@@ -980,55 +1023,59 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   }
 
   let customer = await env.DB.prepare(
-    'SELECT customer_id, company_name, address FROM customer WHERE company_name = ? AND is_active = 1',
+    'SELECT customer_id, company_name, address, contact_person, phone_number FROM customer WHERE company_name = ? AND is_active = 1',
   )
     .bind(body.company_name)
-    .first<{ customer_id: number; company_name: string; address: string | null }>()
-
-  if (!customer) {
-    const created = await env.DB.prepare(
-      'INSERT INTO customer (company_name, address) VALUES (?, ?)',
-    )
-      .bind(body.company_name, body.company_address ?? null)
-      .run()
-    customer = {
-      customer_id: created.meta.last_row_id,
-      company_name: body.company_name,
-      address: body.company_address ?? null,
-    }
-  }
-
-  let contact = await env.DB.prepare(
-    'SELECT contact_id, contact_name, phone_number FROM customer_contact WHERE customer_id = ? AND is_primary = 1 AND is_active = 1',
-  )
-    .bind(customer.customer_id)
-    .first<{ contact_id: number; contact_name: string; phone_number: string }>()
+    .first<{
+      customer_id: number
+      company_name: string
+      address: string | null
+      contact_person: string | null
+      phone_number: string | null
+    }>()
 
   try {
-    if (contact) {
-      if (contact.contact_name !== body.contact_name || contact.phone_number !== body.phone_number) {
-        await env.DB.prepare(
-          'UPDATE customer_contact SET contact_name = ?, phone_number = ? WHERE contact_id = ?',
-        )
-          .bind(body.contact_name, body.phone_number, contact.contact_id)
-          .run()
-      }
-      contact = {
-        contact_id: contact.contact_id,
-        contact_name: body.contact_name,
-        phone_number: body.phone_number,
-      }
-    } else {
+    if (!customer) {
       const created = await env.DB.prepare(
-        'INSERT INTO customer_contact (customer_id, contact_name, phone_number, is_primary) VALUES (?, ?, ?, 1)',
+        `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
+         SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer`,
       )
-        .bind(customer.customer_id, body.contact_name, body.phone_number)
+        .bind(
+          body.company_name,
+          body.company_address ?? null,
+          body.contact_name,
+          body.phone_number,
+          session.username,
+        )
         .run()
-      contact = {
-        contact_id: created.meta.last_row_id,
-        contact_name: body.contact_name,
+      customer = {
+        customer_id: created.meta.last_row_id,
+        company_name: body.company_name,
+        address: body.company_address ?? null,
+        contact_person: body.contact_name,
         phone_number: body.phone_number,
       }
+    } else if (
+      customer.contact_person !== body.contact_name ||
+      customer.phone_number !== body.phone_number
+    ) {
+      await env.DB.batch([
+        env.DB.prepare(
+          'UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1',
+        ).bind(customer.customer_id),
+        env.DB.prepare(
+          `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
+        ).bind(
+          customer.customer_id,
+          customer.company_name,
+          customer.address,
+          body.contact_name,
+          body.phone_number,
+          session.username,
+        ),
+      ])
+      customer = { ...customer, contact_person: body.contact_name, phone_number: body.phone_number }
     }
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -1068,9 +1115,10 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
         skuId = existingProduct.sku_id
       } else {
         const created = await env.DB.prepare(
-          'INSERT INTO product (sku_name, unit, suggested_price) VALUES (?, ?, ?)',
+          `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
+           SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
         )
-          .bind(raw.sku_name, raw.unit, raw.price)
+          .bind(raw.sku_name, raw.unit, raw.price, session.username)
           .run()
         skuId = created.meta.last_row_id
       }
@@ -1113,8 +1161,8 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   const notaResult = await env.DB.prepare(
     `INSERT INTO nota (
        nota_number, nota_date, customer_id, customer_company_name_snapshot, customer_address_snapshot,
-       contact_id, contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       notaNumber,
@@ -1122,9 +1170,8 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
       customer.customer_id,
       customer.company_name,
       customer.address,
-      contact.contact_id,
-      contact.contact_name,
-      contact.phone_number,
+      body.contact_name,
+      body.phone_number,
       totalPrice,
       session.sub,
     )
@@ -1200,6 +1247,11 @@ export default {
       if (request.method === 'DELETE') return handleDeleteCustomer(request, env, customerId)
     }
 
+    const customerHistoryMatch = url.pathname.match(/^\/customers\/(\d+)\/history$/)
+    if (customerHistoryMatch && request.method === 'GET') {
+      return handleGetCustomerHistory(request, env, Number(customerHistoryMatch[1]))
+    }
+
     const billPaymentMatch = url.pathname.match(/^\/customers\/(\d+)\/bill-payments$/)
     if (billPaymentMatch) {
       const customerId = Number(billPaymentMatch[1])
@@ -1232,6 +1284,11 @@ export default {
       const skuId = Number(productMatch[1])
       if (request.method === 'PUT') return handleUpdateProduct(request, env, skuId)
       if (request.method === 'DELETE') return handleDeleteProduct(request, env, skuId)
+    }
+
+    const productHistoryMatch = url.pathname.match(/^\/products\/(\d+)\/history$/)
+    if (productHistoryMatch && request.method === 'GET') {
+      return handleGetProductHistory(request, env, Number(productHistoryMatch[1]))
     }
 
     if (url.pathname === '/nota' && request.method === 'GET') {
