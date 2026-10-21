@@ -423,9 +423,13 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
     'SELECT business_id FROM business ORDER BY business_id ASC LIMIT 1',
   ).first<{ business_id: number }>()
 
+  // RETURNING reads back the just-written row instead of a follow-up SELECT,
+  // which can race against D1's read replicas and see a stale (missing) row.
+  let business: BusinessRow | null
   if (existing) {
-    await env.DB.prepare(
-      'UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?',
+    business = await env.DB.prepare(
+      `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?
+       RETURNING ${BUSINESS_COLUMNS}`,
     )
       .bind(
         body.business_name,
@@ -438,10 +442,11 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
         body.payment_account_number ?? null,
         existing.business_id,
       )
-      .run()
+      .first<BusinessRow>()
   } else {
-    await env.DB.prepare(
-      'INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    business = await env.DB.prepare(
+      `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING ${BUSINESS_COLUMNS}`,
     )
       .bind(
         body.business_name,
@@ -453,12 +458,8 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
         body.payment_account_name ?? null,
         body.payment_account_number ?? null,
       )
-      .run()
+      .first<BusinessRow>()
   }
-
-  const business = await env.DB.prepare(
-    `SELECT ${BUSINESS_COLUMNS} FROM business ORDER BY business_id ASC LIMIT 1`,
-  ).first<BusinessRow>()
 
   return json({ business })
 }
@@ -1169,13 +1170,14 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
 
   const notaId = notaResult.meta.last_row_id
 
-  for (const item of items) {
-    await env.DB.prepare(
-      `INSERT INTO nota_item (
-         nota_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
+  const itemInsert = env.DB.prepare(
+    `INSERT INTO nota_item (
+       nota_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+  await env.DB.batch(
+    items.map((item) =>
+      itemInsert.bind(
         notaId,
         item.sku_id,
         item.item_name_snapshot,
@@ -1185,9 +1187,9 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
         item.discount_amount,
         item.discount_percent,
         item.total_price,
-      )
-      .run()
-  }
+      ),
+    ),
+  )
 
   const nota = await env.DB.prepare(
     `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
