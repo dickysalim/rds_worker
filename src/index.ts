@@ -158,15 +158,17 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
     )
   }
 
-  let customerId: number
+  let customer: CustomerRow | null
   try {
-    const result = await env.DB.prepare(
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    customer = await env.DB.prepare(
       `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
-       SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer`,
+       SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer
+       RETURNING ${CUSTOMER_COLUMNS}`,
     )
       .bind(body.company_name, body.address ?? null, body.contact_person, body.phone_number, session.username)
-      .run()
-    customerId = result.meta.last_row_id
+      .first<CustomerRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json(
@@ -176,12 +178,6 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
     }
     throw err
   }
-
-  const customer = await env.DB.prepare(
-    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE customer_id = ? AND is_active = 1`,
-  )
-    .bind(customerId)
-    .first<CustomerRow>()
 
   return json({ customer }, { status: 201 })
 }
@@ -209,14 +205,18 @@ async function handleUpdateCustomer(
     )
   }
 
+  let customer: CustomerRow | null
   try {
-    await env.DB.batch([
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    const [, insertResult] = await env.DB.batch<CustomerRow>([
       env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1').bind(
         customerId,
       ),
       env.DB.prepare(
         `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+         RETURNING ${CUSTOMER_COLUMNS}`,
       ).bind(
         customerId,
         body.company_name,
@@ -226,6 +226,7 @@ async function handleUpdateCustomer(
         session.username,
       ),
     ])
+    customer = insertResult.results[0] ?? null
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json(
@@ -235,12 +236,6 @@ async function handleUpdateCustomer(
     }
     throw err
   }
-
-  const customer = await env.DB.prepare(
-    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE customer_id = ? AND is_active = 1`,
-  )
-    .bind(customerId)
-    .first<CustomerRow>()
 
   if (!customer) return json({ error: 'Not found' }, { status: 404 })
   return json({ customer })
@@ -287,27 +282,23 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
 
-  let skuId: number
+  let product: ProductRow | null
   try {
-    const result = await env.DB.prepare(
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    product = await env.DB.prepare(
       `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-       SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
+       SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product
+       RETURNING ${PRODUCT_COLUMNS}`,
     )
       .bind(body.sku_name, body.unit, body.suggested_price ?? null, session.username)
-      .run()
-    skuId = result.meta.last_row_id
+      .first<ProductRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
     }
     throw err
   }
-
-  const product = await env.DB.prepare(
-    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE sku_id = ? AND is_active = 1`,
-  )
-    .bind(skuId)
-    .first<ProductRow>()
 
   return json({ product }, { status: 201 })
 }
@@ -327,28 +318,27 @@ async function handleUpdateProduct(
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
 
+  let product: ProductRow | null
   try {
-    await env.DB.batch([
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    const [, insertResult] = await env.DB.batch<ProductRow>([
       env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ? AND is_active = 1').bind(
         skuId,
       ),
       env.DB.prepare(
         `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)`,
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+         RETURNING ${PRODUCT_COLUMNS}`,
       ).bind(skuId, body.sku_name, body.unit, body.suggested_price ?? null, session.username),
     ])
+    product = insertResult.results[0] ?? null
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
     }
     throw err
   }
-
-  const product = await env.DB.prepare(
-    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE sku_id = ? AND is_active = 1`,
-  )
-    .bind(skuId)
-    .first<ProductRow>()
 
   if (!product) return json({ error: 'Not found' }, { status: 404 })
   return json({ product })
