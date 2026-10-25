@@ -107,13 +107,18 @@ const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, updated_by, up
 async function handleListProducts(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  const { results } = await env.DB.prepare(
-    `SELECT ${PRODUCT_COLUMNS},
+  const limitParam = new URL(request.url).searchParams.get('limit')
+  const limit = limitParam ? Math.max(1, Math.min(500, Number(limitParam) || 0)) : null
+
+  const base = `SELECT ${PRODUCT_COLUMNS},
       (SELECT COALESCE(SUM(ni.total_price), 0) FROM nota_item ni
        JOIN nota n ON n.nota_id = ni.nota_id
        WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_revenue
-     FROM product WHERE is_active = 1 ORDER BY sku_id ASC`,
-  ).all<ProductRow & { total_revenue: number }>()
+     FROM product WHERE is_active = 1`
+  const stmt = limit
+    ? env.DB.prepare(`${base} ORDER BY sku_id DESC LIMIT ?`).bind(limit)
+    : env.DB.prepare(`${base} ORDER BY sku_id ASC`)
+  const { results } = await stmt.all<ProductRow & { total_revenue: number }>()
 
   return json({ products: results })
 }
@@ -134,12 +139,17 @@ const CUSTOMER_COLUMNS =
 async function handleListCustomers(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  const { results } = await env.DB.prepare(
-    `SELECT ${CUSTOMER_COLUMNS},
+  const limitParam = new URL(request.url).searchParams.get('limit')
+  const limit = limitParam ? Math.max(1, Math.min(500, Number(limitParam) || 0)) : null
+
+  const base = `SELECT ${CUSTOMER_COLUMNS},
       (SELECT COALESCE(SUM(n.total_price), 0) FROM nota n
        WHERE n.customer_id = customer.customer_id AND n.is_void = 0) AS total_revenue
-     FROM customer WHERE is_active = 1 ORDER BY customer_id ASC`,
-  ).all<CustomerRow & { total_revenue: number }>()
+     FROM customer WHERE is_active = 1`
+  const stmt = limit
+    ? env.DB.prepare(`${base} ORDER BY customer_id DESC LIMIT ?`).bind(limit)
+    : env.DB.prepare(`${base} ORDER BY customer_id ASC`)
+  const { results } = await stmt.all<CustomerRow & { total_revenue: number }>()
 
   return json({ customers: results })
 }
