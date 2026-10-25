@@ -102,12 +102,18 @@ interface ProductRow {
 
 const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, updated_by, updated_at'
 
+// total_revenue is a correlated subquery, not a plain column, so it's kept out of
+// PRODUCT_COLUMNS (which is reused for INSERT/UPDATE ... RETURNING elsewhere).
 async function handleListProducts(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT ${PRODUCT_COLUMNS} FROM product WHERE is_active = 1 ORDER BY sku_id ASC`,
-  ).all<ProductRow>()
+    `SELECT ${PRODUCT_COLUMNS},
+      (SELECT COALESCE(SUM(ni.total_price), 0) FROM nota_item ni
+       JOIN nota n ON n.nota_id = ni.nota_id
+       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_revenue
+     FROM product WHERE is_active = 1 ORDER BY sku_id ASC`,
+  ).all<ProductRow & { total_revenue: number }>()
 
   return json({ products: results })
 }
@@ -129,8 +135,11 @@ async function handleListCustomers(request: Request, env: Env): Promise<Response
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT ${CUSTOMER_COLUMNS} FROM customer WHERE is_active = 1 ORDER BY customer_id ASC`,
-  ).all<CustomerRow>()
+    `SELECT ${CUSTOMER_COLUMNS},
+      (SELECT COALESCE(SUM(n.total_price), 0) FROM nota n
+       WHERE n.customer_id = customer.customer_id AND n.is_void = 0) AS total_revenue
+     FROM customer WHERE is_active = 1 ORDER BY customer_id ASC`,
+  ).all<CustomerRow & { total_revenue: number }>()
 
   return json({ customers: results })
 }
@@ -567,6 +576,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
   const status = url.searchParams.get('status')?.trim() || null
   const startDate = url.searchParams.get('start_date')?.trim() || null
   const endDate = url.searchParams.get('end_date')?.trim() || null
+  const sort = url.searchParams.get('sort')?.trim() || null
 
   const conditions = ['n.is_void = 0']
   const params: (string | number)[] = []
@@ -618,7 +628,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
      FROM nota n
      ${BILL_JOINS}
      WHERE ${whereClause}
-     ORDER BY n.nota_date DESC, n.nota_id DESC`
+     ORDER BY ${sort === 'created' ? 'n.nota_id DESC' : 'n.nota_date DESC, n.nota_id DESC'}`
 
   const stmt = limit
     ? env.DB.prepare(`${baseQuery} LIMIT ? OFFSET ?`).bind(...params, limit, offset)
@@ -932,6 +942,7 @@ interface NotaDetailRow {
 
 interface NotaItemRow {
   nota_item_id: number
+  sku_id: number
   item_name_snapshot: string
   unit_snapshot: string
   qty: number
@@ -962,7 +973,7 @@ async function handleGetNota(
   if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
 
   const { results: items } = await env.DB.prepare(
-    `SELECT nota_item_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
+    `SELECT nota_item_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
      FROM nota_item
      WHERE nota_id = ?
      ORDER BY nota_item_id`,
