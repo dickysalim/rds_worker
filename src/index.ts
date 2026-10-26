@@ -3,6 +3,8 @@ import { getBearerToken, signSession, verifySession } from './auth'
 
 export interface Env {
   DB: D1Database
+  DB_STAGING: D1Database
+  USER_DB: D1Database
   JWT_SECRET: string
   ASSETS: R2Bucket
 }
@@ -12,7 +14,7 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Db-Target',
 }
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -41,7 +43,7 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     return json({ error: 'username and password are required' }, { status: 400 })
   }
 
-  const user = await env.DB.prepare(
+  const user = await env.USER_DB.prepare(
     'SELECT user_id, username, name, password_hash, role, is_active FROM user WHERE username = ?',
   )
     .bind(body.username)
@@ -1237,121 +1239,130 @@ export default {
       return json({ status: 'ok' })
     }
 
+    // Super admins can flip Business Settings to point every DB-backed route
+    // (everything below) at the staging clone instead of production. Only
+    // auth (USER_DB) and JWT_SECRET are unaffected, since those live outside
+    // the swapped `DB` binding.
+    const sessionToken = getBearerToken(request)
+    const session = sessionToken ? await verifySession(sessionToken, env.JWT_SECRET) : null
+    const useStaging = session?.role === 'super_admin' && request.headers.get('X-Db-Target') === 'staging'
+    const effectiveEnv: Env = useStaging ? { ...env, DB: env.DB_STAGING } : env
+
     if (url.pathname === '/auth/login' && request.method === 'POST') {
-      return handleLogin(request, env)
+      return handleLogin(request, effectiveEnv)
     }
 
     if (url.pathname === '/auth/me' && request.method === 'GET') {
-      return handleMe(request, env)
+      return handleMe(request, effectiveEnv)
     }
 
     if (url.pathname === '/customers' && request.method === 'GET') {
-      return handleListCustomers(request, env)
+      return handleListCustomers(request, effectiveEnv)
     }
 
     if (url.pathname === '/customers' && request.method === 'POST') {
-      return handleCreateCustomer(request, env)
+      return handleCreateCustomer(request, effectiveEnv)
     }
 
     const customerMatch = url.pathname.match(/^\/customers\/(\d+)$/)
     if (customerMatch) {
       const customerId = Number(customerMatch[1])
-      if (request.method === 'PUT') return handleUpdateCustomer(request, env, customerId)
-      if (request.method === 'DELETE') return handleDeleteCustomer(request, env, customerId)
+      if (request.method === 'PUT') return handleUpdateCustomer(request, effectiveEnv, customerId)
+      if (request.method === 'DELETE') return handleDeleteCustomer(request, effectiveEnv, customerId)
     }
 
     const customerHistoryMatch = url.pathname.match(/^\/customers\/(\d+)\/history$/)
     if (customerHistoryMatch && request.method === 'GET') {
-      return handleGetCustomerHistory(request, env, Number(customerHistoryMatch[1]))
+      return handleGetCustomerHistory(request, effectiveEnv, Number(customerHistoryMatch[1]))
     }
 
     const billPaymentMatch = url.pathname.match(/^\/customers\/(\d+)\/bill-payments$/)
     if (billPaymentMatch) {
       const customerId = Number(billPaymentMatch[1])
-      if (request.method === 'GET') return handleListBillPayments(request, env, customerId)
-      if (request.method === 'POST') return handleCreateBillPayment(request, env, customerId)
+      if (request.method === 'GET') return handleListBillPayments(request, effectiveEnv, customerId)
+      if (request.method === 'POST') return handleCreateBillPayment(request, effectiveEnv, customerId)
     }
 
     const paymentMatch = url.pathname.match(/^\/payments\/(\d+)$/)
     if (paymentMatch && request.method === 'DELETE') {
-      return handleVoidPayment(request, env, Number(paymentMatch[1]))
+      return handleVoidPayment(request, effectiveEnv, Number(paymentMatch[1]))
     }
 
     const paymentEvidenceMatch2 = url.pathname.match(/^\/payments\/(\d+)\/evidence$/)
     if (paymentEvidenceMatch2) {
       const paymentId = Number(paymentEvidenceMatch2[1])
-      if (request.method === 'PUT') return handleUploadPaymentEvidence(request, env, paymentId)
-      if (request.method === 'GET') return handleGetPaymentEvidence(request, env, paymentId)
+      if (request.method === 'PUT') return handleUploadPaymentEvidence(request, effectiveEnv, paymentId)
+      if (request.method === 'GET') return handleGetPaymentEvidence(request, effectiveEnv, paymentId)
     }
 
     if (url.pathname === '/products' && request.method === 'GET') {
-      return handleListProducts(request, env)
+      return handleListProducts(request, effectiveEnv)
     }
 
     if (url.pathname === '/products' && request.method === 'POST') {
-      return handleCreateProduct(request, env)
+      return handleCreateProduct(request, effectiveEnv)
     }
 
     const productMatch = url.pathname.match(/^\/products\/(\d+)$/)
     if (productMatch) {
       const skuId = Number(productMatch[1])
-      if (request.method === 'PUT') return handleUpdateProduct(request, env, skuId)
-      if (request.method === 'DELETE') return handleDeleteProduct(request, env, skuId)
+      if (request.method === 'PUT') return handleUpdateProduct(request, effectiveEnv, skuId)
+      if (request.method === 'DELETE') return handleDeleteProduct(request, effectiveEnv, skuId)
     }
 
     const productHistoryMatch = url.pathname.match(/^\/products\/(\d+)\/history$/)
     if (productHistoryMatch && request.method === 'GET') {
-      return handleGetProductHistory(request, env, Number(productHistoryMatch[1]))
+      return handleGetProductHistory(request, effectiveEnv, Number(productHistoryMatch[1]))
     }
 
     if (url.pathname === '/nota' && request.method === 'GET') {
-      return handleListNota(request, env)
+      return handleListNota(request, effectiveEnv)
     }
 
     if (url.pathname === '/nota' && request.method === 'POST') {
-      return handleCreateNota(request, env)
+      return handleCreateNota(request, effectiveEnv)
     }
 
     if (url.pathname === '/nota/date-range' && request.method === 'GET') {
-      return handleGetNotaDateRange(request, env)
+      return handleGetNotaDateRange(request, effectiveEnv)
     }
 
     const notaMatch = url.pathname.match(/^\/nota\/(\d+)$/)
     if (notaMatch && request.method === 'GET') {
-      return handleGetNota(request, env, Number(notaMatch[1]))
+      return handleGetNota(request, effectiveEnv, Number(notaMatch[1]))
     }
 
     const notaVoidMatch = url.pathname.match(/^\/nota\/(\d+)\/void$/)
     if (notaVoidMatch && request.method === 'PUT') {
-      return handleVoidNota(request, env, Number(notaVoidMatch[1]))
+      return handleVoidNota(request, effectiveEnv, Number(notaVoidMatch[1]))
     }
 
     if (url.pathname === '/nota/pdf-cache' && request.method === 'DELETE') {
-      return handleClearNotaPdfCache(request, env)
+      return handleClearNotaPdfCache(request, effectiveEnv)
     }
 
     const notaPdfMatch = url.pathname.match(/^\/nota\/(\d+)\/pdf$/)
     if (notaPdfMatch) {
       const notaId = Number(notaPdfMatch[1])
-      if (request.method === 'GET') return handleGetNotaPdf(request, env, notaId)
-      if (request.method === 'PUT') return handlePutNotaPdf(request, env, notaId)
+      if (request.method === 'GET') return handleGetNotaPdf(request, effectiveEnv, notaId)
+      if (request.method === 'PUT') return handlePutNotaPdf(request, effectiveEnv, notaId)
     }
 
 
     if (url.pathname === '/business' && request.method === 'GET') {
-      return handleGetBusiness(request, env)
+      return handleGetBusiness(request, effectiveEnv)
     }
 
     if (url.pathname === '/business' && request.method === 'PUT') {
-      return handleUpdateBusiness(request, env)
+      return handleUpdateBusiness(request, effectiveEnv)
     }
 
     if (url.pathname === '/business/logo' && request.method === 'PUT') {
-      return handleUploadBusinessLogo(request, env)
+      return handleUploadBusinessLogo(request, effectiveEnv)
     }
 
     if (url.pathname === '/business/logo' && request.method === 'GET') {
-      return handleGetBusinessLogo(request, env)
+      return handleGetBusinessLogo(request, effectiveEnv)
     }
 
     return json({ error: 'Not found' }, { status: 404 })
