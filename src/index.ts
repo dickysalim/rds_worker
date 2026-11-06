@@ -98,11 +98,12 @@ interface ProductRow {
   sku_name: string
   unit: string
   suggested_price: number | null
+  cost_price: number | null
   updated_by: string | null
   updated_at: string
 }
 
-const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, updated_by, updated_at'
+const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, cost_price, updated_by, updated_at'
 
 // total_revenue is a correlated subquery, not a plain column, so it's kept out of
 // PRODUCT_COLUMNS (which is reused for INSERT/UPDATE ... RETURNING elsewhere).
@@ -115,12 +116,15 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   const base = `SELECT ${PRODUCT_COLUMNS},
       (SELECT COALESCE(SUM(ni.total_price), 0) FROM nota_item ni
        JOIN nota n ON n.nota_id = ni.nota_id
-       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_revenue
+       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_revenue,
+      (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni
+       JOIN nota n ON n.nota_id = ni.nota_id
+       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_cost
      FROM product WHERE is_active = 1`
   const stmt = limit
     ? env.DB.prepare(`${base} ORDER BY sku_id DESC LIMIT ?`).bind(limit)
     : env.DB.prepare(`${base} ORDER BY sku_id ASC`)
-  const { results } = await stmt.all<ProductRow & { total_revenue: number }>()
+  const { results } = await stmt.all<ProductRow & { total_revenue: number; total_cost: number }>()
 
   return json({ products: results })
 }
@@ -146,12 +150,15 @@ async function handleListCustomers(request: Request, env: Env): Promise<Response
 
   const base = `SELECT ${CUSTOMER_COLUMNS},
       (SELECT COALESCE(SUM(n.total_price), 0) FROM nota n
-       WHERE n.customer_id = customer.customer_id AND n.is_void = 0) AS total_revenue
+       WHERE n.customer_id = customer.customer_id AND n.is_void = 0) AS total_revenue,
+      (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni
+       JOIN nota n ON n.nota_id = ni.nota_id
+       WHERE n.customer_id = customer.customer_id AND n.is_void = 0) AS total_cost
      FROM customer WHERE is_active = 1`
   const stmt = limit
     ? env.DB.prepare(`${base} ORDER BY customer_id DESC LIMIT ?`).bind(limit)
     : env.DB.prepare(`${base} ORDER BY customer_id ASC`)
-  const { results } = await stmt.all<CustomerRow & { total_revenue: number }>()
+  const { results } = await stmt.all<CustomerRow & { total_revenue: number; total_cost: number }>()
 
   return json({ customers: results })
 }
@@ -172,11 +179,8 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
       phone_number?: string
     }>()
     .catch(() => null)
-  if (!body?.company_name || !body.contact_person || !body.phone_number) {
-    return json(
-      { error: 'company_name, contact_person and phone_number are required' },
-      { status: 400 },
-    )
+  if (!body?.company_name) {
+    return json({ error: 'company_name is required' }, { status: 400 })
   }
 
   let customer: CustomerRow | null
@@ -188,7 +192,13 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
        SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer
        RETURNING ${CUSTOMER_COLUMNS}`,
     )
-      .bind(body.company_name, body.address ?? null, body.contact_person, body.phone_number, session.username)
+      .bind(
+        body.company_name,
+        body.address ?? null,
+        body.contact_person || null,
+        body.phone_number || null,
+        session.username,
+      )
       .first<CustomerRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -219,11 +229,8 @@ async function handleUpdateCustomer(
       phone_number?: string
     }>()
     .catch(() => null)
-  if (!body?.company_name || !body.contact_person || !body.phone_number) {
-    return json(
-      { error: 'company_name, contact_person and phone_number are required' },
-      { status: 400 },
-    )
+  if (!body?.company_name) {
+    return json({ error: 'company_name is required' }, { status: 400 })
   }
 
   let customer: CustomerRow | null
@@ -242,8 +249,8 @@ async function handleUpdateCustomer(
         customerId,
         body.company_name,
         body.address ?? null,
-        body.contact_person,
-        body.phone_number,
+        body.contact_person || null,
+        body.phone_number || null,
         session.username,
       ),
     ])
@@ -297,7 +304,12 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
-    .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
+    .json<{
+      sku_name?: string
+      unit?: string
+      suggested_price?: number | null
+      cost_price?: number | null
+    }>()
     .catch(() => null)
   if (!body?.sku_name || !body.unit) {
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
@@ -308,11 +320,11 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
     // RETURNING reads back the just-written row instead of a follow-up SELECT,
     // which can race against D1's read replicas and see a stale (missing) row.
     product = await env.DB.prepare(
-      `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-       SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product
+      `INSERT INTO product (sku_id, sku_name, unit, suggested_price, cost_price, updated_by, updated_at, is_active)
+       SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product
        RETURNING ${PRODUCT_COLUMNS}`,
     )
-      .bind(body.sku_name, body.unit, body.suggested_price ?? null, session.username)
+      .bind(body.sku_name, body.unit, body.suggested_price ?? null, body.cost_price ?? null, session.username)
       .first<ProductRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -333,7 +345,12 @@ async function handleUpdateProduct(
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
-    .json<{ sku_name?: string; unit?: string; suggested_price?: number | null }>()
+    .json<{
+      sku_name?: string
+      unit?: string
+      suggested_price?: number | null
+      cost_price?: number | null
+    }>()
     .catch(() => null)
   if (!body?.sku_name || !body.unit) {
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
@@ -348,10 +365,17 @@ async function handleUpdateProduct(
         skuId,
       ),
       env.DB.prepare(
-        `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+        `INSERT INTO product (sku_id, sku_name, unit, suggested_price, cost_price, updated_by, updated_at, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
          RETURNING ${PRODUCT_COLUMNS}`,
-      ).bind(skuId, body.sku_name, body.unit, body.suggested_price ?? null, session.username),
+      ).bind(
+        skuId,
+        body.sku_name,
+        body.unit,
+        body.suggested_price ?? null,
+        body.cost_price ?? null,
+        session.username,
+      ),
     ])
     product = insertResult.results[0] ?? null
   } catch (err) {
@@ -553,6 +577,8 @@ interface NotaListRow {
   customer_company_name_snapshot: string
   contact_name_snapshot: string
   total_price: number
+  total_cost: number
+  notes: string | null
   paid_amount: number
   status: string
 }
@@ -636,7 +662,8 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
     .first<{ count: number }>()
 
   const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_id, n.customer_company_name_snapshot,
-            n.contact_name_snapshot, s.total_price, s.paid_amount, ${BILL_STATUS} AS status
+            n.contact_name_snapshot, n.notes, s.total_price, s.paid_amount, ${BILL_STATUS} AS status,
+            (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni WHERE ni.nota_id = n.nota_id) AS total_cost
      FROM nota n
      ${BILL_JOINS}
      WHERE ${whereClause}
@@ -950,6 +977,7 @@ interface NotaDetailRow {
   total_price: number
   paid_amount: number
   status: string
+  notes: string | null
 }
 
 interface NotaItemRow {
@@ -962,6 +990,7 @@ interface NotaItemRow {
   discount_amount: number
   discount_percent: number
   total_price: number
+  cost_price_snapshot: number | null
 }
 
 async function handleGetNota(
@@ -974,7 +1003,7 @@ async function handleGetNota(
   const nota = await env.DB.prepare(
     `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
             n.customer_address_snapshot, n.contact_name_snapshot, n.contact_phone_number_snapshot,
-            s.total_price, s.paid_amount, s.status
+            n.notes, s.total_price, s.paid_amount, s.status
      FROM nota n
      JOIN nota_summary s ON s.nota_id = n.nota_id
      WHERE n.nota_id = ?`,
@@ -985,7 +1014,7 @@ async function handleGetNota(
   if (!nota) return json({ error: 'Nota not found' }, { status: 404 })
 
   const { results: items } = await env.DB.prepare(
-    `SELECT nota_item_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
+    `SELECT nota_item_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price, cost_price_snapshot
      FROM nota_item
      WHERE nota_id = ?
      ORDER BY nota_item_id`,
@@ -1012,6 +1041,7 @@ interface CreateNotaBody {
   company_address?: string | null
   contact_name?: string
   phone_number?: string
+  notes?: string | null
   items?: NotaItemInput[]
 }
 
@@ -1110,6 +1140,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
     discount_amount: number
     discount_percent: number
     total_price: number
+    cost_price_snapshot: number | null
   }> = []
 
   for (const raw of body.items) {
@@ -1144,6 +1175,12 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
     const discountPercent = raw.discount_percent ?? 0
     const lineTotal = Math.round(qty * price - discountAmount)
 
+    const productRow = await env.DB.prepare(
+      'SELECT cost_price FROM product WHERE sku_id = ? AND is_active = 1',
+    )
+      .bind(skuId)
+      .first<{ cost_price: number | null }>()
+
     items.push({
       sku_id: skuId,
       item_name_snapshot: raw.sku_name,
@@ -1153,6 +1190,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
       discount_amount: discountAmount,
       discount_percent: discountPercent,
       total_price: lineTotal,
+      cost_price_snapshot: productRow?.cost_price ?? null,
     })
   }
 
@@ -1175,8 +1213,8 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   const notaResult = await env.DB.prepare(
     `INSERT INTO nota (
        nota_number, nota_date, customer_id, customer_company_name_snapshot, customer_address_snapshot,
-       contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by, notes
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       notaNumber,
@@ -1188,6 +1226,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
       body.phone_number,
       totalPrice,
       session.sub,
+      body.notes?.trim() || null,
     )
     .run()
 
@@ -1195,8 +1234,8 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
 
   const itemInsert = env.DB.prepare(
     `INSERT INTO nota_item (
-       nota_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       nota_id, sku_id, item_name_snapshot, unit_snapshot, qty, price, discount_amount, discount_percent, total_price, cost_price_snapshot
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
   await env.DB.batch(
     items.map((item) =>
@@ -1210,6 +1249,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
         item.discount_amount,
         item.discount_percent,
         item.total_price,
+        item.cost_price_snapshot,
       ),
     ),
   )
