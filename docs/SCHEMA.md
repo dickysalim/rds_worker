@@ -10,7 +10,7 @@
 
 R2 bucket: binding `ASSETS`, bucket `rds-factory-management-assets` (PDF cache, uploaded evidence/logos).
 
-Source of truth: `migrations/0001_init.sql` through `migrations/0021_nota_notes.sql`. This doc describes the schema as of `0021`, after the `0015` versioning rewrite.
+Source of truth: `migrations/0001_init.sql` through `migrations/0022_stock_adjustment_types.sql`. This doc describes the schema as of `0022`, after the `0015` versioning rewrite.
 
 ## `USER_DB` (`user_accounts`)
 
@@ -171,8 +171,8 @@ Append-only record of every staff-reported stock movement (not sales — a sale'
 | `id` | INTEGER PK AUTOINCREMENT | |
 | `sku_id` | INTEGER NOT NULL | unenforced |
 | `date` | TEXT NOT NULL | business date of the event |
-| `movement_type` | TEXT NOT NULL | `CHECK IN ('stock_input', 'stock_loss', 'adjustment')` |
-| `qty` | REAL NOT NULL | signed. `CHECK`: `stock_input` must be `> 0`, `stock_loss` must be `< 0`, `adjustment` can be either |
+| `movement_type` | TEXT NOT NULL | `CHECK IN ('stock_input', 'stock_loss', 'adjust_up', 'adjust_down')` (0022, replaced the generic `adjustment` type) |
+| `qty` | REAL NOT NULL | signed. `CHECK`: `stock_input`/`adjust_up` must be `> 0`, `stock_loss`/`adjust_down` must be `< 0` |
 | `note` | TEXT | reason (damage, recount, PO ref, etc.) |
 | `created_by` | TEXT | username |
 | `created_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |

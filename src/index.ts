@@ -119,14 +119,101 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
        WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_revenue,
       (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni
        JOIN nota n ON n.nota_id = ni.nota_id
-       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_cost
+       WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_cost,
+      (SELECT current_stock FROM product_stock WHERE sku_id = product.sku_id) AS current_stock
      FROM product WHERE is_active = 1`
   const stmt = limit
     ? env.DB.prepare(`${base} ORDER BY sku_id DESC LIMIT ?`).bind(limit)
     : env.DB.prepare(`${base} ORDER BY sku_id ASC`)
-  const { results } = await stmt.all<ProductRow & { total_revenue: number; total_cost: number }>()
+  const { results } = await stmt.all<
+    ProductRow & { total_revenue: number; total_cost: number; current_stock: number | null }
+  >()
 
   return json({ products: results })
+}
+
+interface StockLedgerRow {
+  kind: 'ledger' | 'sale'
+  id: number
+  sku_id: number
+  item_name: string
+  date: string
+  movement_type: string
+  qty: number
+  note: string | null
+  created_by: string | null
+  created_at: string
+  invoice_number: string | null
+}
+
+// A sale never writes to stock_ledger (trg_nota_item_debit_stock debits
+// product_stock straight from nota_item -- see docs/SCHEMA.md), so it's
+// unioned in here from nota_item live rather than being a stored movement.
+async function handleListStockLedger(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const limitParam = new URL(request.url).searchParams.get('limit')
+  const limit = limitParam ? Math.max(1, Math.min(2000, Number(limitParam) || 0)) : null
+
+  const base = `SELECT 'ledger' AS kind, sl.id, sl.sku_id,
+      (SELECT sku_name FROM product WHERE sku_id = sl.sku_id AND is_active = 1) AS item_name,
+      sl.date, sl.movement_type, sl.qty, sl.note, sl.created_by, sl.created_at,
+      NULL AS invoice_number
+     FROM stock_ledger sl
+     UNION ALL
+     SELECT 'sale' AS kind, ni.nota_item_id AS id, ni.sku_id,
+      (SELECT sku_name FROM product WHERE sku_id = ni.sku_id AND is_active = 1) AS item_name,
+      n.nota_date AS date, 'sale' AS movement_type, -ni.qty AS qty, NULL AS note, NULL AS created_by,
+      n.created_at, n.nota_number AS invoice_number
+     FROM nota_item ni
+     JOIN nota n ON n.nota_id = ni.nota_id
+     WHERE n.is_void = 0`
+  const stmt = limit
+    ? env.DB.prepare(`${base} ORDER BY date DESC, created_at DESC LIMIT ?`).bind(limit)
+    : env.DB.prepare(`${base} ORDER BY date DESC, created_at DESC`)
+  const { results } = await stmt.all<StockLedgerRow>()
+
+  return json({ entries: results })
+}
+
+async function handleCreateStockMovement(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      sku_id?: number
+      date?: string
+      movement_type?: string
+      qty?: number
+      note?: string | null
+    }>()
+    .catch(() => null)
+
+  if (!body?.sku_id || !body.date || !body.movement_type || body.qty == null) {
+    return json({ error: 'sku_id, date, movement_type, and qty are required' }, { status: 400 })
+  }
+  if (!['stock_input', 'stock_loss', 'adjust_up', 'adjust_down'].includes(body.movement_type)) {
+    return json({ error: 'Invalid movement_type' }, { status: 400 })
+  }
+  const magnitude = Math.abs(Number(body.qty))
+  if (!magnitude) {
+    return json({ error: 'qty must be non-zero' }, { status: 400 })
+  }
+  // Every movement_type carries a fixed sign (table CHECK enforces it); the
+  // caller sends an unsigned magnitude, so sign it here.
+  const signedQty =
+    body.movement_type === 'stock_loss' || body.movement_type === 'adjust_down' ? -magnitude : magnitude
+
+  const entry = await env.DB.prepare(
+    `INSERT INTO stock_ledger (sku_id, date, movement_type, qty, note, created_by)
+     VALUES (?, ?, ?, ?, ?, ?)
+     RETURNING id, sku_id, date, movement_type, qty, note, created_by, created_at`,
+  )
+    .bind(body.sku_id, body.date, body.movement_type, signedQty, body.note || null, session.username)
+    .first<Omit<StockLedgerRow, 'item_name'>>()
+
+  return json({ entry }, { status: 201 })
 }
 
 interface CustomerRow {
@@ -509,13 +596,107 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
   return json({ business })
 }
 
+interface BusinessAliasBody {
+  business_name?: string
+  business_address?: string | null
+  business_contact_person?: string | null
+  business_contact_number?: string | null
+  business_email?: string | null
+  payment_bank_name?: string | null
+  payment_account_name?: string | null
+  payment_account_number?: string | null
+}
+
+// Aliases are extra rows in the same `business` table (alternate identities
+// for the company, e.g. a different legal entity name on some notas). The
+// first row by business_id is always the primary; every other row is an
+// alias.
+async function handleListBusinessAliases(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT ${BUSINESS_COLUMNS} FROM business ORDER BY business_id ASC LIMIT -1 OFFSET 1`,
+  ).all<BusinessRow>()
+
+  return json({ aliases: results })
+}
+
+async function handleCreateBusinessAlias(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<BusinessAliasBody>().catch(() => null)
+  if (!body?.business_name) {
+    return json({ error: 'business_name is required' }, { status: 400 })
+  }
+
+  const business = await env.DB.prepare(
+    `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING ${BUSINESS_COLUMNS}`,
+  )
+    .bind(
+      body.business_name,
+      body.business_address ?? null,
+      body.business_contact_person ?? null,
+      body.business_contact_number ?? null,
+      body.business_email ?? null,
+      body.payment_bank_name ?? null,
+      body.payment_account_name ?? null,
+      body.payment_account_number ?? null,
+    )
+    .first<BusinessRow>()
+
+  return json({ business })
+}
+
+async function handleUpdateBusinessAlias(request: Request, env: Env, businessId: number): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<BusinessAliasBody>().catch(() => null)
+  if (!body?.business_name) {
+    return json({ error: 'business_name is required' }, { status: 400 })
+  }
+
+  const primary = await env.DB.prepare('SELECT business_id FROM business ORDER BY business_id ASC LIMIT 1').first<{
+    business_id: number
+  }>()
+  if (primary?.business_id === businessId) {
+    return json({ error: 'Not an alias' }, { status: 400 })
+  }
+
+  const business = await env.DB.prepare(
+    `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?
+     RETURNING ${BUSINESS_COLUMNS}`,
+  )
+    .bind(
+      body.business_name,
+      body.business_address ?? null,
+      body.business_contact_person ?? null,
+      body.business_contact_number ?? null,
+      body.business_email ?? null,
+      body.payment_bank_name ?? null,
+      body.payment_account_name ?? null,
+      body.payment_account_number ?? null,
+      businessId,
+    )
+    .first<BusinessRow>()
+
+  if (!business) return json({ error: 'Alias not found' }, { status: 404 })
+
+  return json({ business })
+}
+
 const LOGO_CONTENT_TYPES: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
   'image/webp': 'webp',
 }
 
-async function handleUploadBusinessLogo(request: Request, env: Env): Promise<Response> {
+async function handleUploadBusinessLogo(
+  request: Request,
+  env: Env,
+  lookup: string,
+  binds: (number | string)[] = [],
+): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const contentType = request.headers.get('Content-Type') ?? ''
@@ -525,11 +706,13 @@ async function handleUploadBusinessLogo(request: Request, env: Env): Promise<Res
   }
 
   const existing = await env.DB.prepare(
-    'SELECT business_id, business_logo_key FROM business ORDER BY business_id ASC LIMIT 1',
-  ).first<{ business_id: number; business_logo_key: string | null }>()
+    `SELECT business_id, business_logo_key FROM business WHERE ${lookup}`,
+  )
+    .bind(...binds)
+    .first<{ business_id: number; business_logo_key: string | null }>()
 
   if (!existing) {
-    return json({ error: 'Business not set up yet' }, { status: 400 })
+    return json({ error: 'Business not found' }, { status: 400 })
   }
 
   const key = `business-logos/${existing.business_id}-${Date.now()}.${ext}`
@@ -546,10 +729,15 @@ async function handleUploadBusinessLogo(request: Request, env: Env): Promise<Res
   return json({ business_logo_key: key })
 }
 
-async function handleGetBusinessLogo(_request: Request, env: Env): Promise<Response> {
-  const business = await env.DB.prepare(
-    'SELECT business_logo_key FROM business ORDER BY business_id ASC LIMIT 1',
-  ).first<{ business_logo_key: string | null }>()
+async function handleGetBusinessLogo(
+  _request: Request,
+  env: Env,
+  lookup: string,
+  binds: (number | string)[] = [],
+): Promise<Response> {
+  const business = await env.DB.prepare(`SELECT business_logo_key FROM business WHERE ${lookup}`)
+    .bind(...binds)
+    .first<{ business_logo_key: string | null }>()
 
   if (!business?.business_logo_key) {
     return json({ error: 'Not found' }, { status: 404 })
@@ -575,12 +763,14 @@ interface NotaListRow {
   nota_date: string
   customer_id: number
   customer_company_name_snapshot: string
-  contact_name_snapshot: string
+  contact_name_snapshot: string | null
   total_price: number
   total_cost: number
   notes: string | null
   paid_amount: number
   status: string
+  pajak_name: string | null
+  pajak_percentage: number | null
 }
 
 // Payment is scoped to the bill (customer + month), so every nota in a bill shows the
@@ -662,7 +852,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
     .first<{ count: number }>()
 
   const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_id, n.customer_company_name_snapshot,
-            n.contact_name_snapshot, n.notes, s.total_price, s.paid_amount, ${BILL_STATUS} AS status,
+            n.contact_name_snapshot, n.notes, n.pajak_name, n.pajak_percentage, s.total_price, s.paid_amount, ${BILL_STATUS} AS status,
             (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni WHERE ni.nota_id = n.nota_id) AS total_cost
      FROM nota n
      ${BILL_JOINS}
@@ -972,12 +1162,15 @@ interface NotaDetailRow {
   nota_date: string
   customer_company_name_snapshot: string
   customer_address_snapshot: string | null
-  contact_name_snapshot: string
-  contact_phone_number_snapshot: string
+  contact_name_snapshot: string | null
+  contact_phone_number_snapshot: string | null
   total_price: number
   paid_amount: number
   status: string
   notes: string | null
+  business_id: number | null
+  pajak_name: string | null
+  pajak_percentage: number | null
 }
 
 interface NotaItemRow {
@@ -1003,7 +1196,7 @@ async function handleGetNota(
   const nota = await env.DB.prepare(
     `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
             n.customer_address_snapshot, n.contact_name_snapshot, n.contact_phone_number_snapshot,
-            n.notes, s.total_price, s.paid_amount, s.status
+            n.notes, n.business_id, n.pajak_name, n.pajak_percentage, s.total_price, s.paid_amount, s.status
      FROM nota n
      JOIN nota_summary s ON s.nota_id = n.nota_id
      WHERE n.nota_id = ?`,
@@ -1025,6 +1218,51 @@ async function handleGetNota(
   return json({ nota: { ...nota, items } })
 }
 
+interface UpdateNotaBody {
+  notes?: string | null
+  business_id?: number | null
+  pajak_name?: string | null
+  pajak_percentage?: number | null
+}
+
+async function handleUpdateNota(request: Request, env: Env, notaId: number): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<UpdateNotaBody>().catch(() => null)
+  if (!body) return json({ error: 'Invalid body' }, { status: 400 })
+
+  if (body.notes && body.notes.length > 200) {
+    return json({ error: 'notes must be 200 characters or fewer' }, { status: 400 })
+  }
+  if (body.pajak_percentage != null && (body.pajak_percentage < 0 || body.pajak_percentage > 100)) {
+    return json({ error: 'pajak_percentage must be between 0 and 100' }, { status: 400 })
+  }
+  if (body.business_id != null) {
+    const businessExists = await env.DB.prepare('SELECT 1 FROM business WHERE business_id = ?')
+      .bind(body.business_id)
+      .first()
+    if (!businessExists) {
+      return json({ error: 'business_id does not exist' }, { status: 400 })
+    }
+  }
+
+  const result = await env.DB.prepare(
+    `UPDATE nota SET notes = ?, business_id = ?, pajak_name = ?, pajak_percentage = ? WHERE nota_id = ?`,
+  )
+    .bind(
+      body.notes?.trim() || null,
+      body.business_id ?? null,
+      body.pajak_name?.trim() || null,
+      body.pajak_percentage ?? null,
+      notaId,
+    )
+    .run()
+
+  if (result.meta.changes === 0) return json({ error: 'Nota not found' }, { status: 404 })
+
+  return json({ ok: true })
+}
+
 interface NotaItemInput {
   sku_id?: number | null
   sku_name?: string
@@ -1039,9 +1277,12 @@ interface CreateNotaBody {
   nota_date?: string
   company_name?: string
   company_address?: string | null
-  contact_name?: string
-  phone_number?: string
+  contact_name?: string | null
+  phone_number?: string | null
   notes?: string | null
+  business_id?: number | null
+  pajak_name?: string | null
+  pajak_percentage?: number | null
   items?: NotaItemInput[]
 }
 
@@ -1050,21 +1291,31 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<CreateNotaBody>().catch(() => null)
-  if (
-    !body?.nota_date ||
-    !body.company_name ||
-    !body.contact_name ||
-    !body.phone_number ||
-    !body.items?.length
-  ) {
+  if (!body?.nota_date || !body.company_name || !body.items?.length) {
     return json(
-      {
-        error:
-          'nota_date, company_name, contact_name, phone_number and at least one item are required',
-      },
+      { error: 'nota_date, company_name and at least one item are required' },
       { status: 400 },
     )
   }
+  if (body.notes && body.notes.length > 200) {
+    return json({ error: 'notes must be 200 characters or fewer' }, { status: 400 })
+  }
+
+  if (body.pajak_percentage != null && (body.pajak_percentage < 0 || body.pajak_percentage > 100)) {
+    return json({ error: 'pajak_percentage must be between 0 and 100' }, { status: 400 })
+  }
+
+  if (body.business_id != null) {
+    const businessExists = await env.DB.prepare('SELECT 1 FROM business WHERE business_id = ?')
+      .bind(body.business_id)
+      .first()
+    if (!businessExists) {
+      return json({ error: 'business_id does not exist' }, { status: 400 })
+    }
+  }
+
+  const contactName = body.contact_name?.trim() || null
+  const phoneNumber = body.phone_number?.trim() || null
 
   let customer = await env.DB.prepare(
     'SELECT customer_id, company_name, address, contact_person, phone_number FROM customer WHERE company_name = ? AND is_active = 1',
@@ -1084,25 +1335,16 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
         `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
          SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer`,
       )
-        .bind(
-          body.company_name,
-          body.company_address ?? null,
-          body.contact_name,
-          body.phone_number,
-          session.username,
-        )
+        .bind(body.company_name, body.company_address ?? null, contactName, phoneNumber, session.username)
         .run()
       customer = {
         customer_id: created.meta.last_row_id,
         company_name: body.company_name,
         address: body.company_address ?? null,
-        contact_person: body.contact_name,
-        phone_number: body.phone_number,
+        contact_person: contactName,
+        phone_number: phoneNumber,
       }
-    } else if (
-      customer.contact_person !== body.contact_name ||
-      customer.phone_number !== body.phone_number
-    ) {
+    } else if (customer.contact_person !== contactName || customer.phone_number !== phoneNumber) {
       await env.DB.batch([
         env.DB.prepare(
           'UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1',
@@ -1114,12 +1356,12 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
           customer.customer_id,
           customer.company_name,
           customer.address,
-          body.contact_name,
-          body.phone_number,
+          contactName,
+          phoneNumber,
           session.username,
         ),
       ])
-      customer = { ...customer, contact_person: body.contact_name, phone_number: body.phone_number }
+      customer = { ...customer, contact_person: contactName, phone_number: phoneNumber }
     }
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -1213,8 +1455,9 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
   const notaResult = await env.DB.prepare(
     `INSERT INTO nota (
        nota_number, nota_date, customer_id, customer_company_name_snapshot, customer_address_snapshot,
-       contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by, notes
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       contact_name_snapshot, contact_phone_number_snapshot, total_price, created_by, notes, business_id,
+       pajak_name, pajak_percentage
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       notaNumber,
@@ -1222,11 +1465,14 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
       customer.customer_id,
       customer.company_name,
       customer.address,
-      body.contact_name,
-      body.phone_number,
+      contactName,
+      phoneNumber,
       totalPrice,
       session.sub,
       body.notes?.trim() || null,
+      body.business_id ?? null,
+      body.pajak_name?.trim() || null,
+      body.pajak_percentage ?? null,
     )
     .run()
 
@@ -1372,6 +1618,10 @@ export default {
       return handleGetNota(request, effectiveEnv, Number(notaMatch[1]))
     }
 
+    if (notaMatch && request.method === 'PUT') {
+      return handleUpdateNota(request, effectiveEnv, Number(notaMatch[1]))
+    }
+
     const notaVoidMatch = url.pathname.match(/^\/nota\/(\d+)\/void$/)
     if (notaVoidMatch && request.method === 'PUT') {
       return handleVoidNota(request, effectiveEnv, Number(notaVoidMatch[1]))
@@ -1389,6 +1639,14 @@ export default {
     }
 
 
+    if (url.pathname === '/stock-ledger' && request.method === 'GET') {
+      return handleListStockLedger(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/stock-ledger' && request.method === 'POST') {
+      return handleCreateStockMovement(request, effectiveEnv)
+    }
+
     if (url.pathname === '/business' && request.method === 'GET') {
       return handleGetBusiness(request, effectiveEnv)
     }
@@ -1398,11 +1656,32 @@ export default {
     }
 
     if (url.pathname === '/business/logo' && request.method === 'PUT') {
-      return handleUploadBusinessLogo(request, effectiveEnv)
+      return handleUploadBusinessLogo(request, effectiveEnv, 'business_id = (SELECT business_id FROM business ORDER BY business_id ASC LIMIT 1)')
     }
 
     if (url.pathname === '/business/logo' && request.method === 'GET') {
-      return handleGetBusinessLogo(request, effectiveEnv)
+      return handleGetBusinessLogo(request, effectiveEnv, 'business_id = (SELECT business_id FROM business ORDER BY business_id ASC LIMIT 1)')
+    }
+
+    if (url.pathname === '/business/aliases' && request.method === 'GET') {
+      return handleListBusinessAliases(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/business/aliases' && request.method === 'POST') {
+      return handleCreateBusinessAlias(request, effectiveEnv)
+    }
+
+    const businessAliasMatch = url.pathname.match(/^\/business\/aliases\/(\d+)$/)
+    if (businessAliasMatch && request.method === 'PUT') {
+      return handleUpdateBusinessAlias(request, effectiveEnv, Number(businessAliasMatch[1]))
+    }
+
+    const businessAliasLogoMatch = url.pathname.match(/^\/business\/aliases\/(\d+)\/logo$/)
+    if (businessAliasLogoMatch && request.method === 'PUT') {
+      return handleUploadBusinessLogo(request, effectiveEnv, 'business_id = ?', [Number(businessAliasLogoMatch[1])])
+    }
+    if (businessAliasLogoMatch && request.method === 'GET') {
+      return handleGetBusinessLogo(request, effectiveEnv, 'business_id = ?', [Number(businessAliasLogoMatch[1])])
     }
 
     return json({ error: 'Not found' }, { status: 404 })
