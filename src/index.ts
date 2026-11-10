@@ -379,6 +379,23 @@ const MOVEMENT_TYPES = [
 ]
 const MOVEMENT_MINUS_TYPES = ['stock_loss', 'stock_out', 'stock_defect', 'adjust_down']
 
+// Same formula as handleListProducts' current_stock column -- the one source
+// of truth for "how much of this SKU is left", used to guard every stock
+// deduction below against going negative.
+async function getCurrentStock(env: Env, skuId: number): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT COALESCE(SUM(sl.qty), 0) FROM stock_ledger sl WHERE sl.sku_id = ? AND sl.is_active = 1)
+       -
+       (SELECT COALESCE(SUM(ni.qty), 0) FROM nota_item ni JOIN nota n ON n.nota_id = ni.nota_id
+        WHERE ni.sku_id = ? AND n.is_void = 0)
+       AS current_stock`,
+  )
+    .bind(skuId, skuId)
+    .first<{ current_stock: number }>()
+  return row?.current_stock ?? 0
+}
+
 interface StockLedgerRow {
   kind: 'ledger' | 'sale'
   id: number
@@ -461,6 +478,13 @@ async function handleCreateStockMovement(request: Request, env: Env): Promise<Re
   // caller sends an unsigned magnitude, so sign it here.
   const signedQty = MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
 
+  if (signedQty < 0) {
+    const current = await getCurrentStock(env, body.sku_id)
+    if (current + signedQty < 0) {
+      return json({ error: `Not enough stock: only ${current} available` }, { status: 400 })
+    }
+  }
+
   const entry = await env.DB.prepare(
     `INSERT INTO stock_ledger (sku_id, date, movement_type, qty, note, created_by)
      VALUES (?, ?, ?, ?, ?, ?)
@@ -491,6 +515,19 @@ async function handleUpdateStockMovement(request: Request, env: Env, id: number)
     return json({ error: 'qty must be non-zero' }, { status: 400 })
   }
   const signedQty = MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
+
+  const existing = await env.DB.prepare('SELECT sku_id, qty FROM stock_ledger WHERE id = ? AND is_active = 1')
+    .bind(id)
+    .first<{ sku_id: number; qty: number }>()
+  if (!existing) return json({ error: 'Stock ledger entry not found' }, { status: 404 })
+
+  if (signedQty < 0) {
+    const current = await getCurrentStock(env, existing.sku_id)
+    const withoutThisRow = current - existing.qty
+    if (withoutThisRow + signedQty < 0) {
+      return json({ error: `Not enough stock: only ${withoutThisRow} available` }, { status: 400 })
+    }
+  }
 
   const entry = await env.DB.prepare(
     `UPDATE stock_ledger
@@ -1805,6 +1842,21 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
       total_price: lineTotal,
       cost_price_snapshot: productRow?.cost_price ?? null,
     })
+  }
+
+  const qtyBySku = new Map<number, number>()
+  for (const item of items) {
+    qtyBySku.set(item.sku_id, (qtyBySku.get(item.sku_id) ?? 0) + item.qty)
+  }
+  for (const [skuId, qty] of qtyBySku) {
+    const current = await getCurrentStock(env, skuId)
+    if (current - qty < 0) {
+      const name = items.find((item) => item.sku_id === skuId)?.item_name_snapshot ?? `SKU ${skuId}`
+      return json(
+        { error: `Not enough stock for ${name}: only ${current} available` },
+        { status: 400 },
+      )
+    }
   }
 
   const totalPrice = items.reduce((sum, item) => sum + item.total_price, 0)
