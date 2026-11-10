@@ -191,7 +191,7 @@ async function handleUpdatePassword(request: Request, env: Env): Promise<Respons
   return json({ token: newToken, user: userToResponse(user) })
 }
 
-const ASSIGNABLE_ROLES = ['staff', 'quality_control']
+const ASSIGNABLE_ROLES = ['admin', 'owner']
 
 function generateNumericPassword(length = 8): string {
   const bytes = crypto.getRandomValues(new Uint8Array(length))
@@ -204,7 +204,7 @@ async function handleListUsers(request: Request, env: Env): Promise<Response> {
   if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
 
   const { results } = await env.USER_DB.prepare(
-    "SELECT user_id, username, name, role FROM user WHERE role != 'super_admin' AND is_active = 1 ORDER BY username",
+    "SELECT user_id, username, name, role FROM user WHERE role NOT IN ('super_admin', 'staging_admin') AND is_active = 1 ORDER BY username",
   ).all<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
 
   return json({ users: results })
@@ -254,7 +254,7 @@ async function requireManageableUser(env: Env, userId: string): Promise<UserRow 
   )
     .bind(userId)
     .first<UserRow>()
-  if (!user || user.role === 'super_admin') return null
+  if (!user || user.role === 'super_admin' || user.role === 'staging_admin') return null
   return user
 }
 
@@ -375,6 +375,7 @@ const MOVEMENT_TYPES = [
   'stock_out',
   'stock_defect',
   'adjust_down',
+  'initial_stock',
 ]
 const MOVEMENT_MINUS_TYPES = ['stock_loss', 'stock_out', 'stock_defect', 'adjust_down']
 
@@ -631,24 +632,22 @@ async function handleUpdateCustomer(
   try {
     // RETURNING reads back the just-written row instead of a follow-up SELECT,
     // which can race against D1's read replicas and see a stale (missing) row.
-    const [, insertResult] = await env.DB.batch<CustomerRow>([
-      env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1').bind(
-        customerId,
-      ),
-      env.DB.prepare(
-        `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
-         RETURNING ${CUSTOMER_COLUMNS}`,
-      ).bind(
-        customerId,
+    // The customer_history trigger captures this update, so this is a plain
+    // in-place UPDATE, not an append.
+    customer = await env.DB.prepare(
+      `UPDATE customer SET company_name = ?, address = ?, contact_person = ?, phone_number = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE customer_id = ? AND is_active = 1
+       RETURNING ${CUSTOMER_COLUMNS}`,
+    )
+      .bind(
         body.company_name,
         body.address ?? null,
         body.contact_person || null,
         body.phone_number || null,
         session.sub,
-      ),
-    ])
-    customer = insertResult.results[0] ?? null
+        customerId,
+      )
+      .first<CustomerRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json(
@@ -671,7 +670,9 @@ async function handleGetCustomerHistory(
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT row_increment, ${CUSTOMER_COLUMNS}, is_active FROM customer WHERE customer_id = ? ORDER BY row_increment DESC`,
+    `SELECT history_id AS row_increment, customer_id, company_name, address, contact_person, phone_number,
+            changed_by AS updated_by, changed_at AS updated_at, is_active
+     FROM customer_history WHERE customer_id = ? ORDER BY history_id DESC`,
   )
     .bind(customerId)
     .all<CustomerRow & { row_increment: number; is_active: number }>()
@@ -685,10 +686,13 @@ async function handleDeleteCustomer(
   env: Env,
   customerId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  await env.DB.prepare('UPDATE customer SET is_active = 0 WHERE customer_id = ? AND is_active = 1')
-    .bind(customerId)
+  await env.DB.prepare(
+    'UPDATE customer SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE customer_id = ? AND is_active = 1',
+  )
+    .bind(session.sub, customerId)
     .run()
 
   return json({ ok: true })
@@ -704,23 +708,42 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
       unit?: string
       suggested_price?: number | null
       cost_price?: number | null
+      initial_stock?: number | null
     }>()
     .catch(() => null)
   if (!body?.sku_name || !body.unit) {
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
+  if (body.cost_price != null && body.suggested_price != null && body.cost_price > body.suggested_price) {
+    return json({ error: 'Cost cannot exceed the price' }, { status: 400 })
+  }
+
+  const initialStock = body.initial_stock ?? 0
 
   let product: ProductRow | null
   try {
     // RETURNING reads back the just-written row instead of a follow-up SELECT,
     // which can race against D1's read replicas and see a stale (missing) row.
-    product = await env.DB.prepare(
+    const insertProduct = env.DB.prepare(
       `INSERT INTO product (sku_id, sku_name, unit, suggested_price, cost_price, updated_by, updated_at, is_active)
        SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product
        RETURNING ${PRODUCT_COLUMNS}`,
-    )
-      .bind(body.sku_name, body.unit, body.suggested_price ?? null, body.cost_price ?? null, session.sub)
-      .first<ProductRow>()
+    ).bind(body.sku_name, body.unit, body.suggested_price ?? null, body.cost_price ?? null, session.sub)
+
+    if (initialStock > 0) {
+      const [productResult] = await env.DB.batch<ProductRow>([insertProduct])
+      product = productResult.results[0] ?? null
+      if (product) {
+        await env.DB.prepare(
+          `INSERT INTO stock_ledger (sku_id, date, movement_type, qty, note, created_by)
+           VALUES (?, date('now'), 'initial_stock', ?, 'Initial stock on product creation', ?)`,
+        )
+          .bind(product.sku_id, initialStock, session.sub)
+          .run()
+      }
+    } else {
+      product = await insertProduct.first<ProductRow>()
+    }
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
@@ -750,29 +773,30 @@ async function handleUpdateProduct(
   if (!body?.sku_name || !body.unit) {
     return json({ error: 'sku_name and unit are required' }, { status: 400 })
   }
+  if (body.cost_price != null && body.suggested_price != null && body.cost_price > body.suggested_price) {
+    return json({ error: 'Cost cannot exceed the price' }, { status: 400 })
+  }
 
   let product: ProductRow | null
   try {
     // RETURNING reads back the just-written row instead of a follow-up SELECT,
     // which can race against D1's read replicas and see a stale (missing) row.
-    const [, insertResult] = await env.DB.batch<ProductRow>([
-      env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ? AND is_active = 1').bind(
-        skuId,
-      ),
-      env.DB.prepare(
-        `INSERT INTO product (sku_id, sku_name, unit, suggested_price, cost_price, updated_by, updated_at, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
-         RETURNING ${PRODUCT_COLUMNS}`,
-      ).bind(
-        skuId,
+    // The product_history trigger captures this update, so this is a plain
+    // in-place UPDATE, not an append.
+    product = await env.DB.prepare(
+      `UPDATE product SET sku_name = ?, unit = ?, suggested_price = ?, cost_price = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE sku_id = ? AND is_active = 1
+       RETURNING ${PRODUCT_COLUMNS}`,
+    )
+      .bind(
         body.sku_name,
         body.unit,
         body.suggested_price ?? null,
         body.cost_price ?? null,
         session.sub,
-      ),
-    ])
-    product = insertResult.results[0] ?? null
+        skuId,
+      )
+      .first<ProductRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return json({ error: 'A product with this SKU name already exists' }, { status: 409 })
@@ -792,7 +816,9 @@ async function handleGetProductHistory(
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT row_increment, ${PRODUCT_COLUMNS}, is_active FROM product WHERE sku_id = ? ORDER BY row_increment DESC`,
+    `SELECT history_id AS row_increment, sku_id, sku_name, unit, suggested_price, cost_price,
+            changed_by AS updated_by, changed_at AS updated_at, is_active
+     FROM product_history WHERE sku_id = ? ORDER BY history_id DESC`,
   )
     .bind(skuId)
     .all<ProductRow & { row_increment: number; is_active: number }>()
@@ -806,10 +832,13 @@ async function handleDeleteProduct(
   env: Env,
   skuId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  await env.DB.prepare('UPDATE product SET is_active = 0 WHERE sku_id = ? AND is_active = 1')
-    .bind(skuId)
+  await env.DB.prepare(
+    'UPDATE product SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE sku_id = ? AND is_active = 1',
+  )
+    .bind(session.sub, skuId)
     .run()
 
   return json({ ok: true })
@@ -842,7 +871,8 @@ async function handleGetBusiness(request: Request, env: Env): Promise<Response> 
 }
 
 async function handleUpdateBusiness(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
     .json<{
@@ -869,7 +899,7 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
   let business: BusinessRow | null
   if (existing) {
     business = await env.DB.prepare(
-      `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?
+      `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE business_id = ?
        RETURNING ${BUSINESS_COLUMNS}`,
     )
       .bind(
@@ -881,12 +911,13 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
         body.payment_bank_name ?? null,
         body.payment_account_name ?? null,
         body.payment_account_number ?? null,
+        session.sub,
         existing.business_id,
       )
       .first<BusinessRow>()
   } else {
     business = await env.DB.prepare(
-      `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
        RETURNING ${BUSINESS_COLUMNS}`,
     )
       .bind(
@@ -898,6 +929,7 @@ async function handleUpdateBusiness(request: Request, env: Env): Promise<Respons
         body.payment_bank_name ?? null,
         body.payment_account_name ?? null,
         body.payment_account_number ?? null,
+        session.sub,
       )
       .first<BusinessRow>()
   }
@@ -924,14 +956,15 @@ async function handleListBusinessAliases(request: Request, env: Env): Promise<Re
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
-    `SELECT ${BUSINESS_COLUMNS} FROM business ORDER BY business_id ASC LIMIT -1 OFFSET 1`,
+    `SELECT ${BUSINESS_COLUMNS} FROM business WHERE is_active = 1 ORDER BY business_id ASC LIMIT -1 OFFSET 1`,
   ).all<BusinessRow>()
 
   return json({ aliases: results })
 }
 
 async function handleCreateBusinessAlias(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<BusinessAliasBody>().catch(() => null)
   if (!body?.business_name) {
@@ -939,7 +972,7 @@ async function handleCreateBusinessAlias(request: Request, env: Env): Promise<Re
   }
 
   const business = await env.DB.prepare(
-    `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO business (business_name, business_address, business_contact_person, business_contact_number, business_email, payment_bank_name, payment_account_name, payment_account_number, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
      RETURNING ${BUSINESS_COLUMNS}`,
   )
     .bind(
@@ -951,6 +984,7 @@ async function handleCreateBusinessAlias(request: Request, env: Env): Promise<Re
       body.payment_bank_name ?? null,
       body.payment_account_name ?? null,
       body.payment_account_number ?? null,
+      session.sub,
     )
     .first<BusinessRow>()
 
@@ -958,7 +992,8 @@ async function handleCreateBusinessAlias(request: Request, env: Env): Promise<Re
 }
 
 async function handleUpdateBusinessAlias(request: Request, env: Env, businessId: number): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<BusinessAliasBody>().catch(() => null)
   if (!body?.business_name) {
@@ -973,7 +1008,7 @@ async function handleUpdateBusinessAlias(request: Request, env: Env, businessId:
   }
 
   const business = await env.DB.prepare(
-    `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ? WHERE business_id = ?
+    `UPDATE business SET business_name = ?, business_address = ?, business_contact_person = ?, business_contact_number = ?, business_email = ?, payment_bank_name = ?, payment_account_name = ?, payment_account_number = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE business_id = ? AND is_active = 1
      RETURNING ${BUSINESS_COLUMNS}`,
   )
     .bind(
@@ -985,6 +1020,7 @@ async function handleUpdateBusinessAlias(request: Request, env: Env, businessId:
       body.payment_bank_name ?? null,
       body.payment_account_name ?? null,
       body.payment_account_number ?? null,
+      session.sub,
       businessId,
     )
     .first<BusinessRow>()
@@ -992,6 +1028,30 @@ async function handleUpdateBusinessAlias(request: Request, env: Env, businessId:
   if (!business) return json({ error: 'Alias not found' }, { status: 404 })
 
   return json({ business })
+}
+
+// Soft delete only -- is_active flips to 0, row stays so past nota/payment
+// PDFs issued under this alias keep working.
+async function handleDeleteBusinessAlias(request: Request, env: Env, businessId: number): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const primary = await env.DB.prepare('SELECT business_id FROM business ORDER BY business_id ASC LIMIT 1').first<{
+    business_id: number
+  }>()
+  if (primary?.business_id === businessId) {
+    return json({ error: 'Cannot delete the primary business' }, { status: 400 })
+  }
+
+  const result = await env.DB.prepare(
+    'UPDATE business SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE business_id = ? AND is_active = 1',
+  )
+    .bind(session.sub, businessId)
+    .run()
+
+  if (result.meta.changes === 0) return json({ error: 'Alias not found' }, { status: 404 })
+
+  return json({ ok: true })
 }
 
 const LOGO_CONTENT_TYPES: Record<string, string> = {
@@ -1535,7 +1595,8 @@ interface UpdateNotaBody {
 }
 
 async function handleUpdateNota(request: Request, env: Env, notaId: number): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<UpdateNotaBody>().catch(() => null)
   if (!body) return json({ error: 'Invalid body' }, { status: 400 })
@@ -1556,13 +1617,14 @@ async function handleUpdateNota(request: Request, env: Env, notaId: number): Pro
   }
 
   const result = await env.DB.prepare(
-    `UPDATE nota SET notes = ?, business_id = ?, pajak_name = ?, pajak_percentage = ? WHERE nota_id = ?`,
+    `UPDATE nota SET notes = ?, business_id = ?, pajak_name = ?, pajak_percentage = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE nota_id = ?`,
   )
     .bind(
       body.notes?.trim() || null,
       body.business_id ?? null,
       body.pajak_name?.trim() || null,
       body.pajak_percentage ?? null,
+      session.sub,
       notaId,
     )
     .run()
@@ -1840,7 +1902,9 @@ export default {
     // the swapped `DB` binding.
     const sessionToken = getBearerToken(request)
     const session = sessionToken ? await verifySession(sessionToken, env.JWT_SECRET) : null
-    const useStaging = session?.role === 'super_admin' && request.headers.get('X-Db-Target') === 'staging'
+    const useStaging =
+      (session?.role === 'super_admin' || session?.role === 'staging_admin') &&
+      request.headers.get('X-Db-Target') === 'staging'
     const effectiveEnv: Env = useStaging ? { ...env, DB: env.DB_STAGING } : env
 
     if (url.pathname === '/auth/login' && request.method === 'POST') {
@@ -2019,6 +2083,9 @@ export default {
     const businessAliasMatch = url.pathname.match(/^\/business\/aliases\/(\d+)$/)
     if (businessAliasMatch && request.method === 'PUT') {
       return handleUpdateBusinessAlias(request, effectiveEnv, Number(businessAliasMatch[1]))
+    }
+    if (businessAliasMatch && request.method === 'DELETE') {
+      return handleDeleteBusinessAlias(request, effectiveEnv, Number(businessAliasMatch[1]))
     }
 
     const businessAliasLogoMatch = url.pathname.match(/^\/business\/aliases\/(\d+)\/logo$/)
