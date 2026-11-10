@@ -10,20 +10,26 @@
 
 R2 bucket: binding `ASSETS`, bucket `rds-factory-management-assets` (PDF cache, uploaded evidence/logos).
 
-Source of truth: `migrations/0001_init.sql` through `migrations/0022_stock_adjustment_types.sql`. This doc describes the schema as of `0022`, after the `0015` versioning rewrite.
+Source of truth: `migrations/0001_init.sql` through `migrations/0031_user_audit_columns.sql`. This doc describes the schema as of `0031`, after the `0015` versioning rewrite.
 
 ## `USER_DB` (`user_accounts`)
 
 ### `user`
 | Column | Type | Notes |
 |---|---|---|
-| `user_id` | INTEGER PK AUTOINCREMENT | |
+| `user_id` | TEXT PK | UUID v4, since 0028 (was `INTEGER PK AUTOINCREMENT`) |
 | `username` | TEXT NOT NULL UNIQUE | |
 | `name` | TEXT NOT NULL | |
 | `password_hash` | TEXT NOT NULL | bcrypt |
-| `role` | TEXT NOT NULL | `super_admin` gates the staging-DB toggle |
-| `is_active` | INTEGER NOT NULL DEFAULT 1 | |
+| `role` | TEXT NOT NULL | `super_admin` gates the staging-DB toggle; `staff`/`quality_control` are `ASSIGNABLE_ROLES` (Team Settings) |
+| `is_active` | INTEGER NOT NULL DEFAULT 1 | 0001; since 0030 also flipped by `handleDeactivateUser` (soft deactivate from Team Settings) |
 | `created_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |
+| `must_change_password` | INTEGER NOT NULL DEFAULT 0 | 0030, set on `handleCreateUser`/`handleResetUserPassword`; cleared by `handleUpdatePassword`; frontend gates the whole app on this via `ForcePasswordChangePage` |
+| `created_by` | TEXT | 0031, `user.user_id` UUID of the super_admin who created this account (self for the original seeded accounts, unset) |
+| `updated_by` | TEXT | 0031, `user.user_id` UUID of whoever last touched this row (self-service name/password change, or a super_admin's role edit/reset/deactivate via Team Settings) |
+| `updated_at` | TEXT | 0031 |
+
+Not yet hydrated to a display name anywhere (no UI surfaces it yet) and not yet covered by the history-snapshot idea (parked — see root `CLAUDE.md`/chat history; `user` now has real edit endpoints too, so it belongs on that list when that work resumes).
 
 The old `user` table on `DB`/`DB_STAGING` (from `0001_init.sql`) is dead — auth moved here. Drop it on both if not already done.
 
@@ -56,7 +62,7 @@ Single-row settings table. Columns accumulated across migrations:
 | `address` | TEXT | |
 | `contact_person` | TEXT | merged in from the dropped `customer_contact` table |
 | `phone_number` | TEXT | |
-| `updated_by` | TEXT | |
+| `updated_by` | TEXT | `user.user_id` UUID since 0029 (was username); `handleGetCustomerHistory` hydrates it to a display name via `hydrateUserNames` |
 | `updated_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |
 | `is_active` | INTEGER NOT NULL DEFAULT 1 | current-version flag |
 
@@ -75,7 +81,7 @@ An edit inserts a new row for the same `customer_id` and flips the old row's `is
 | `unit` | TEXT NOT NULL | |
 | `suggested_price` | INTEGER | sell price |
 | `cost_price` | INTEGER | 0018, harga modal / cost price — what the business pays to acquire or produce it |
-| `updated_by` | TEXT | |
+| `updated_by` | TEXT | `user.user_id` UUID since 0029 (was username); `handleGetProductHistory` hydrates it to a display name via `hydrateUserNames` |
 | `updated_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |
 | `is_active` | INTEGER NOT NULL DEFAULT 1 | |
 
@@ -95,7 +101,7 @@ Immutable once created (void is the only state change — no versioning needed).
 | `contact_name_snapshot` | TEXT NOT NULL | 0001 |
 | `contact_phone_number_snapshot` | TEXT NOT NULL | 0001 |
 | `total_price` | INTEGER NOT NULL | 0001 |
-| `created_by` | INTEGER NOT NULL | 0001, unenforced (was FK to `user`, now dangling — auth moved to `USER_DB`) |
+| `created_by` | INTEGER NOT NULL | 0001, unenforced (was FK to `user`, now dangling — auth moved to `USER_DB`). Holds `user.user_id` UUID since 0029 despite the INTEGER column affinity (SQLite isn't strict); not currently surfaced in any API response |
 | `is_void` | INTEGER NOT NULL DEFAULT 0 | 0001 |
 | `created_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | 0001 |
 | `pdf_r2_key` | TEXT | 0013, server-side PDF cache pointer |
@@ -154,40 +160,38 @@ status = 'void'    if nota.is_void
        | 'unpaid'  otherwise
 ```
 
-### `product_stock`
-Cached current balance per SKU, not versioned (one row per `sku_id` forever — product price/name edits never touch it). Entirely trigger-maintained; no application code writes to it.
+### `current_stock` (computed, no table)
+`product_stock` and all four stock triggers (`trg_product_seed_stock`, `trg_stock_ledger_apply`, `trg_nota_item_debit_stock`, `trg_nota_void_restock`) were removed in `0026` — they were a cache that had to be kept in lockstep with every stock-affecting write, and every 0015-style table rebuild risked silently dropping them. `current_stock` is now computed live in `handleListProducts` (`src/index.ts`):
 
-| Column | Type | Notes |
-|---|---|---|
-| `sku_id` | INTEGER PRIMARY KEY | |
-| `current_stock` | REAL NOT NULL DEFAULT 0 | |
-| `updated_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |
+```sql
+SUM(stock_ledger.qty WHERE sku_id = ?)
+  - SUM(nota_item.qty WHERE sku_id = ? AND nota.is_void = 0)
+```
+
+No cache to drift, no trigger to lose on a rebuild. Cost is an aggregate per SKU per query instead of a cached read — fine at current scale (see chat: matters only around several hundred SKUs on one list page, and the fix then is one GROUP BY join, not reintroducing the cache).
 
 ### `stock_ledger`
-Append-only record of every staff-reported stock movement (not sales — a sale's debit comes straight from `nota_item`, see triggers below, so it isn't duplicated here).
+Append-only record of every staff-reported stock movement (not sales — a sale's debit is computed live from `nota_item`, see above, so it isn't duplicated here).
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | INTEGER PK AUTOINCREMENT | |
 | `sku_id` | INTEGER NOT NULL | unenforced |
 | `date` | TEXT NOT NULL | business date of the event |
-| `movement_type` | TEXT NOT NULL | `CHECK IN ('stock_input', 'stock_loss', 'adjust_up', 'adjust_down')` (0022, replaced the generic `adjustment` type) |
-| `qty` | REAL NOT NULL | signed. `CHECK`: `stock_input`/`adjust_up` must be `> 0`, `stock_loss`/`adjust_down` must be `< 0` |
+| `movement_type` | TEXT NOT NULL | `CHECK IN ('production_in', 'shipment_return', 'adjust_up', 'stock_loss', 'stock_out', 'stock_defect', 'adjust_down')` (0026 — `stock_input` renamed to `production_in`; added `shipment_return`, `stock_out`, `stock_defect`) |
+| `qty` | REAL NOT NULL | signed. `CHECK`: `production_in`/`shipment_return`/`adjust_up` must be `> 0`, `stock_loss`/`stock_out`/`stock_defect`/`adjust_down` must be `< 0` |
 | `note` | TEXT | reason (damage, recount, PO ref, etc.) |
-| `created_by` | TEXT | username |
+| `created_by` | TEXT | `user.user_id` UUID since 0029 (was username); `handleListStockLedger` hydrates it to a display name via `hydrateUserNames` |
 | `created_at` | TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP | |
+| `is_active` | INTEGER NOT NULL DEFAULT 1 | 0027, soft delete — `handleDeleteStockMovement` flips this instead of a real `DELETE`; `handleListStockLedger` excludes `is_active = 0` rows |
+| `updated_by` | TEXT | 0027, `user.user_id` UUID since 0029 (was username); set on edit or delete; hydrated same as `created_by` |
+| `updated_at` | TEXT | 0027 |
 
 Index: `idx_stock_ledger_sku (sku_id)`.
 
-### Stock triggers (0019)
-All stock bookkeeping happens in the database, not application code — one invariant, enforced regardless of which code path writes the row:
+Cause distinctions, by design: `stock_out` = intentional personal/take-home draw; `stock_defect` = defective item written off, typically after a `shipment_return`; `stock_loss` = known-cause shrinkage (breakage, expiry, fire, theft); `adjust_down`/`adjust_up` = unknown-cause reconciliation when the count is just off.
 
-- `trg_product_seed_stock` — `AFTER INSERT ON product`, `INSERT OR IGNORE INTO product_stock`. Only the first INSERT for a given `sku_id` creates the row; later version rows from an edit are no-ops here.
-- `trg_stock_ledger_apply` — `AFTER INSERT ON stock_ledger`, applies `qty` to `product_stock.current_stock`.
-- `trg_nota_item_debit_stock` — `AFTER INSERT ON nota_item`, debits `product_stock.current_stock` by the item's `qty`.
-- `trg_nota_void_restock` — `AFTER UPDATE OF is_void ON nota WHEN NEW.is_void = 1 AND OLD.is_void = 0`, credits back every one of that nota's items. One-way only — there's no un-void flow to handle the reverse.
-
-**Caveat:** if `product` or `nota_item` ever needs a 0015-style rebuild (`DROP`+recreate rather than a plain `ALTER TABLE ADD COLUMN`), these triggers must be dropped first and recreated after, or the rebuild silently drops them.
+Production reject / QC reject tracking is pinned — not implemented yet.
 
 ## No foreign keys, anywhere (since 0015)
 

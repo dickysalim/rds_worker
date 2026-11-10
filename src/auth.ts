@@ -1,8 +1,9 @@
 export interface SessionPayload {
-  sub: number
+  sub: string
   username: string
   name: string
   role: string
+  must_change_password: boolean
   exp: number
 }
 

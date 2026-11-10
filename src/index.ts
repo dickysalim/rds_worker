@@ -28,13 +28,69 @@ function json(data: unknown, init: ResponseInit = {}): Response {
   })
 }
 
+// created_by/updated_by columns store the user's UUID, not a displayable
+// name -- USER_DB is a separate D1 database (no cross-DB SQL join), so
+// hydration is a second query + in-memory map, applied per response.
+async function hydrateUserNames<T extends object>(env: Env, rows: T[], fields: (keyof T)[]): Promise<T[]> {
+  const ids = new Set<string>()
+  for (const row of rows) {
+    for (const field of fields) {
+      const value = row[field]
+      if (typeof value === 'string') ids.add(value)
+    }
+  }
+  if (ids.size === 0) return rows
+
+  const idList = [...ids]
+  const placeholders = idList.map(() => '?').join(',')
+  const { results } = await env.USER_DB.prepare(
+    `SELECT user_id, name FROM user WHERE user_id IN (${placeholders})`,
+  )
+    .bind(...idList)
+    .all<{ user_id: string; name: string }>()
+  const nameById = new Map(results.map((u) => [u.user_id, u.name]))
+
+  return rows.map((row) => {
+    const hydrated = { ...row }
+    for (const field of fields) {
+      const value = row[field]
+      if (typeof value === 'string') {
+        hydrated[field] = (nameById.get(value) ?? value) as T[keyof T]
+      }
+    }
+    return hydrated
+  })
+}
+
 interface UserRow {
-  user_id: number
+  user_id: string
   username: string
   name: string
   password_hash: string
   role: string
   is_active: number
+  must_change_password: number
+}
+
+function userToSession(user: Pick<UserRow, 'user_id' | 'username' | 'name' | 'role' | 'must_change_password'>) {
+  return {
+    sub: user.user_id,
+    username: user.username,
+    name: user.name,
+    role: user.role,
+    must_change_password: !!user.must_change_password,
+    exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+  }
+}
+
+function userToResponse(user: Pick<UserRow, 'user_id' | 'username' | 'name' | 'role' | 'must_change_password'>) {
+  return {
+    id: user.user_id,
+    username: user.username,
+    name: user.name,
+    role: user.role,
+    must_change_password: !!user.must_change_password,
+  }
 }
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
@@ -44,7 +100,7 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   }
 
   const user = await env.USER_DB.prepare(
-    'SELECT user_id, username, name, password_hash, role, is_active FROM user WHERE username = ?',
+    'SELECT user_id, username, name, password_hash, role, is_active, must_change_password FROM user WHERE username = ?',
   )
     .bind(body.username)
     .first<UserRow>()
@@ -58,21 +114,9 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     return json({ error: 'Invalid username or password' }, { status: 401 })
   }
 
-  const token = await signSession(
-    {
-      sub: user.user_id,
-      username: user.username,
-      name: user.name,
-      role: user.role,
-      exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
-    },
-    env.JWT_SECRET,
-  )
+  const token = await signSession(userToSession(user), env.JWT_SECRET)
 
-  return json({
-    token,
-    user: { id: user.user_id, username: user.username, name: user.name, role: user.role },
-  })
+  return json({ token, user: userToResponse(user) })
 }
 
 async function handleMe(request: Request, env: Env): Promise<Response> {
@@ -83,8 +127,193 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
   if (!session) return json({ error: 'Invalid or expired token' }, { status: 401 })
 
   return json({
-    user: { id: session.sub, username: session.username, name: session.name, role: session.role },
+    user: {
+      id: session.sub,
+      username: session.username,
+      name: session.name,
+      role: session.role,
+      must_change_password: session.must_change_password,
+    },
   })
+}
+
+async function handleUpdateAccount(request: Request, env: Env): Promise<Response> {
+  const token = getBearerToken(request)
+  if (!token) return json({ error: 'Missing token' }, { status: 401 })
+  const session = await verifySession(token, env.JWT_SECRET)
+  if (!session) return json({ error: 'Invalid or expired token' }, { status: 401 })
+
+  const body = await request.json<{ name?: string }>().catch(() => null)
+  if (!body?.name?.trim()) return json({ error: 'name is required' }, { status: 400 })
+
+  const user = await env.USER_DB.prepare(
+    'UPDATE user SET name = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? RETURNING user_id, username, name, role, must_change_password',
+  )
+    .bind(body.name.trim(), session.sub, session.sub)
+    .first<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role' | 'must_change_password'>>()
+  if (!user) return json({ error: 'User not found' }, { status: 404 })
+
+  const newToken = await signSession(userToSession(user), env.JWT_SECRET)
+  return json({ token: newToken, user: userToResponse(user) })
+}
+
+async function handleUpdatePassword(request: Request, env: Env): Promise<Response> {
+  const token = getBearerToken(request)
+  if (!token) return json({ error: 'Missing token' }, { status: 401 })
+  const session = await verifySession(token, env.JWT_SECRET)
+  if (!session) return json({ error: 'Invalid or expired token' }, { status: 401 })
+
+  const body = await request.json<{ current_password?: string; new_password?: string }>().catch(() => null)
+  if (!body?.current_password || !body.new_password) {
+    return json({ error: 'current_password and new_password are required' }, { status: 400 })
+  }
+  if (body.new_password.length < 8) {
+    return json({ error: 'New password must be at least 8 characters' }, { status: 400 })
+  }
+
+  const existing = await env.USER_DB.prepare('SELECT user_id, password_hash FROM user WHERE user_id = ?')
+    .bind(session.sub)
+    .first<{ user_id: string; password_hash: string }>()
+  if (!existing) return json({ error: 'User not found' }, { status: 404 })
+
+  const valid = await bcrypt.compare(body.current_password, existing.password_hash)
+  if (!valid) return json({ error: 'Current password is incorrect' }, { status: 401 })
+
+  const newHash = await bcrypt.hash(body.new_password, 10)
+  const user = await env.USER_DB.prepare(
+    'UPDATE user SET password_hash = ?, must_change_password = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? RETURNING user_id, username, name, role, must_change_password',
+  )
+    .bind(newHash, existing.user_id, existing.user_id)
+    .first<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role' | 'must_change_password'>>()
+  if (!user) return json({ error: 'User not found' }, { status: 404 })
+
+  const newToken = await signSession(userToSession(user), env.JWT_SECRET)
+  return json({ token: newToken, user: userToResponse(user) })
+}
+
+const ASSIGNABLE_ROLES = ['staff', 'quality_control']
+
+function generateNumericPassword(length = 8): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(length))
+  return Array.from(bytes, (b) => b % 10).join('')
+}
+
+async function handleListUsers(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+  if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
+
+  const { results } = await env.USER_DB.prepare(
+    "SELECT user_id, username, name, role FROM user WHERE role != 'super_admin' AND is_active = 1 ORDER BY username",
+  ).all<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
+
+  return json({ users: results })
+}
+
+async function handleCreateUser(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+  if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
+
+  const body = await request.json<{ username?: string; name?: string; role?: string }>().catch(() => null)
+  if (!body?.username?.trim() || !body.name?.trim() || !body.role) {
+    return json({ error: 'username, name, and role are required' }, { status: 400 })
+  }
+  if (!ASSIGNABLE_ROLES.includes(body.role)) {
+    return json({ error: 'Invalid role' }, { status: 400 })
+  }
+
+  const password = generateNumericPassword()
+  const passwordHash = await bcrypt.hash(password, 10)
+  const userId = crypto.randomUUID()
+
+  let user: Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'> | null
+  try {
+    user = await env.USER_DB.prepare(
+      `INSERT INTO user (user_id, username, name, password_hash, role, is_active, must_change_password, created_by, updated_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, CURRENT_TIMESTAMP)
+       RETURNING user_id, username, name, role`,
+    )
+      .bind(userId, body.username.trim(), body.name.trim(), passwordHash, body.role, session.sub, session.sub)
+      .first<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A user with this username already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  return json({ user, temporary_password: password }, { status: 201 })
+}
+
+// Shared by edit/reset-password/deactivate -- all three only ever act on a
+// non-super_admin user, even if the frontend already filters the list.
+async function requireManageableUser(env: Env, userId: string): Promise<UserRow | null> {
+  const user = await env.USER_DB.prepare(
+    'SELECT user_id, username, name, password_hash, role, is_active, must_change_password FROM user WHERE user_id = ?',
+  )
+    .bind(userId)
+    .first<UserRow>()
+  if (!user || user.role === 'super_admin') return null
+  return user
+}
+
+async function handleUpdateUserRole(request: Request, env: Env, userId: string): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+  if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
+
+  const body = await request.json<{ role?: string }>().catch(() => null)
+  if (!body?.role || !ASSIGNABLE_ROLES.includes(body.role)) {
+    return json({ error: 'Invalid role' }, { status: 400 })
+  }
+
+  const existing = await requireManageableUser(env, userId)
+  if (!existing) return json({ error: 'User not found' }, { status: 404 })
+
+  const user = await env.USER_DB.prepare(
+    'UPDATE user SET role = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? RETURNING user_id, username, name, role',
+  )
+    .bind(body.role, session.sub, userId)
+    .first<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
+
+  return json({ user })
+}
+
+async function handleResetUserPassword(request: Request, env: Env, userId: string): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+  if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
+
+  const existing = await requireManageableUser(env, userId)
+  if (!existing) return json({ error: 'User not found' }, { status: 404 })
+
+  const password = generateNumericPassword()
+  const passwordHash = await bcrypt.hash(password, 10)
+  await env.USER_DB.prepare(
+    'UPDATE user SET password_hash = ?, must_change_password = 1, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
+  )
+    .bind(passwordHash, session.sub, userId)
+    .run()
+
+  return json({ temporary_password: password })
+}
+
+async function handleDeactivateUser(request: Request, env: Env, userId: string): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+  if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
+
+  const existing = await requireManageableUser(env, userId)
+  if (!existing) return json({ error: 'User not found' }, { status: 404 })
+
+  await env.USER_DB.prepare(
+    'UPDATE user SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
+  )
+    .bind(session.sub, userId)
+    .run()
+
+  return json({ success: true })
 }
 
 async function requireAuth(request: Request, env: Env) {
@@ -120,7 +349,13 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
       (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni
        JOIN nota n ON n.nota_id = ni.nota_id
        WHERE ni.sku_id = product.sku_id AND n.is_void = 0) AS total_cost,
-      (SELECT current_stock FROM product_stock WHERE sku_id = product.sku_id) AS current_stock
+      (
+        (SELECT COALESCE(SUM(sl.qty), 0) FROM stock_ledger sl WHERE sl.sku_id = product.sku_id AND sl.is_active = 1)
+        -
+        (SELECT COALESCE(SUM(ni.qty), 0) FROM nota_item ni
+         JOIN nota n ON n.nota_id = ni.nota_id
+         WHERE ni.sku_id = product.sku_id AND n.is_void = 0)
+      ) AS current_stock
      FROM product WHERE is_active = 1`
   const stmt = limit
     ? env.DB.prepare(`${base} ORDER BY sku_id DESC LIMIT ?`).bind(limit)
@@ -131,6 +366,17 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
 
   return json({ products: results })
 }
+
+const MOVEMENT_TYPES = [
+  'production_in',
+  'shipment_return',
+  'adjust_up',
+  'stock_loss',
+  'stock_out',
+  'stock_defect',
+  'adjust_down',
+]
+const MOVEMENT_MINUS_TYPES = ['stock_loss', 'stock_out', 'stock_defect', 'adjust_down']
 
 interface StockLedgerRow {
   kind: 'ledger' | 'sale'
@@ -143,12 +389,17 @@ interface StockLedgerRow {
   note: string | null
   created_by: string | null
   created_at: string
+  updated_by: string | null
+  updated_at: string | null
   invoice_number: string | null
 }
 
-// A sale never writes to stock_ledger (trg_nota_item_debit_stock debits
-// product_stock straight from nota_item -- see docs/SCHEMA.md), so it's
-// unioned in here from nota_item live rather than being a stored movement.
+// A sale never writes to stock_ledger -- current_stock is computed live as
+// SUM(stock_ledger.qty) - SUM(nota_item.qty) (see handleListProducts), so
+// a sale is unioned in here from nota_item for display only, not stored, and
+// is never editable/deletable. A soft-deleted ledger row (is_active = 0) is
+// excluded here -- it still exists in the table for the audit trail
+// (updated_by/updated_at record who deleted it) but never shown again.
 async function handleListStockLedger(request: Request, env: Env): Promise<Response> {
   if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -158,13 +409,15 @@ async function handleListStockLedger(request: Request, env: Env): Promise<Respon
   const base = `SELECT 'ledger' AS kind, sl.id, sl.sku_id,
       (SELECT sku_name FROM product WHERE sku_id = sl.sku_id AND is_active = 1) AS item_name,
       sl.date, sl.movement_type, sl.qty, sl.note, sl.created_by, sl.created_at,
+      sl.updated_by, sl.updated_at,
       NULL AS invoice_number
      FROM stock_ledger sl
+     WHERE sl.is_active = 1
      UNION ALL
      SELECT 'sale' AS kind, ni.nota_item_id AS id, ni.sku_id,
       (SELECT sku_name FROM product WHERE sku_id = ni.sku_id AND is_active = 1) AS item_name,
-      n.nota_date AS date, 'sale' AS movement_type, -ni.qty AS qty, NULL AS note, NULL AS created_by,
-      n.created_at, n.nota_number AS invoice_number
+      n.nota_date AS date, 'sale' AS movement_type, -ni.qty AS qty, NULL AS note, n.created_by,
+      n.created_at, NULL AS updated_by, NULL AS updated_at, n.nota_number AS invoice_number
      FROM nota_item ni
      JOIN nota n ON n.nota_id = ni.nota_id
      WHERE n.is_void = 0`
@@ -172,8 +425,9 @@ async function handleListStockLedger(request: Request, env: Env): Promise<Respon
     ? env.DB.prepare(`${base} ORDER BY date DESC, created_at DESC LIMIT ?`).bind(limit)
     : env.DB.prepare(`${base} ORDER BY date DESC, created_at DESC`)
   const { results } = await stmt.all<StockLedgerRow>()
+  const entries = await hydrateUserNames(env, results, ['created_by', 'updated_by'])
 
-  return json({ entries: results })
+  return json({ entries })
 }
 
 async function handleCreateStockMovement(request: Request, env: Env): Promise<Response> {
@@ -193,7 +447,7 @@ async function handleCreateStockMovement(request: Request, env: Env): Promise<Re
   if (!body?.sku_id || !body.date || !body.movement_type || body.qty == null) {
     return json({ error: 'sku_id, date, movement_type, and qty are required' }, { status: 400 })
   }
-  if (!['stock_input', 'stock_loss', 'adjust_up', 'adjust_down'].includes(body.movement_type)) {
+  if (!MOVEMENT_TYPES.includes(body.movement_type)) {
     return json({ error: 'Invalid movement_type' }, { status: 400 })
   }
   const magnitude = Math.abs(Number(body.qty))
@@ -202,18 +456,69 @@ async function handleCreateStockMovement(request: Request, env: Env): Promise<Re
   }
   // Every movement_type carries a fixed sign (table CHECK enforces it); the
   // caller sends an unsigned magnitude, so sign it here.
-  const signedQty =
-    body.movement_type === 'stock_loss' || body.movement_type === 'adjust_down' ? -magnitude : magnitude
+  const signedQty = MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
 
   const entry = await env.DB.prepare(
     `INSERT INTO stock_ledger (sku_id, date, movement_type, qty, note, created_by)
      VALUES (?, ?, ?, ?, ?, ?)
-     RETURNING id, sku_id, date, movement_type, qty, note, created_by, created_at`,
+     RETURNING id, sku_id, date, movement_type, qty, note, created_by, created_at, updated_by, updated_at`,
   )
-    .bind(body.sku_id, body.date, body.movement_type, signedQty, body.note || null, session.username)
+    .bind(body.sku_id, body.date, body.movement_type, signedQty, body.note || null, session.sub)
     .first<Omit<StockLedgerRow, 'item_name'>>()
 
   return json({ entry }, { status: 201 })
+}
+
+async function handleUpdateStockMovement(request: Request, env: Env, id: number): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{ date?: string; movement_type?: string; qty?: number; note?: string | null }>()
+    .catch(() => null)
+
+  if (!body?.date || !body.movement_type || body.qty == null) {
+    return json({ error: 'date, movement_type, and qty are required' }, { status: 400 })
+  }
+  if (!MOVEMENT_TYPES.includes(body.movement_type)) {
+    return json({ error: 'Invalid movement_type' }, { status: 400 })
+  }
+  const magnitude = Math.abs(Number(body.qty))
+  if (!magnitude) {
+    return json({ error: 'qty must be non-zero' }, { status: 400 })
+  }
+  const signedQty = MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
+
+  const entry = await env.DB.prepare(
+    `UPDATE stock_ledger
+     SET date = ?, movement_type = ?, qty = ?, note = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND is_active = 1
+     RETURNING id, sku_id, date, movement_type, qty, note, created_by, created_at, updated_by, updated_at`,
+  )
+    .bind(body.date, body.movement_type, signedQty, body.note || null, session.sub, id)
+    .first<Omit<StockLedgerRow, 'item_name'>>()
+
+  if (!entry) return json({ error: 'Stock ledger entry not found' }, { status: 404 })
+  return json({ entry })
+}
+
+// Soft delete only -- is_active flips to 0, row stays for the audit trail
+// (updated_by records who deleted it). Never a real DELETE.
+async function handleDeleteStockMovement(request: Request, env: Env, id: number): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const entry = await env.DB.prepare(
+    `UPDATE stock_ledger
+     SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND is_active = 1
+     RETURNING id`,
+  )
+    .bind(session.sub, id)
+    .first()
+
+  if (!entry) return json({ error: 'Stock ledger entry not found' }, { status: 404 })
+  return json({ success: true })
 }
 
 interface CustomerRow {
@@ -284,7 +589,7 @@ async function handleCreateCustomer(request: Request, env: Env): Promise<Respons
         body.address ?? null,
         body.contact_person || null,
         body.phone_number || null,
-        session.username,
+        session.sub,
       )
       .first<CustomerRow>()
   } catch (err) {
@@ -338,7 +643,7 @@ async function handleUpdateCustomer(
         body.address ?? null,
         body.contact_person || null,
         body.phone_number || null,
-        session.username,
+        session.sub,
       ),
     ])
     customer = insertResult.results[0] ?? null
@@ -368,8 +673,9 @@ async function handleGetCustomerHistory(
   )
     .bind(customerId)
     .all<CustomerRow & { row_increment: number; is_active: number }>()
+  const history = await hydrateUserNames(env, results, ['updated_by'])
 
-  return json({ history: results })
+  return json({ history })
 }
 
 async function handleDeleteCustomer(
@@ -411,7 +717,7 @@ async function handleCreateProduct(request: Request, env: Env): Promise<Response
        SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product
        RETURNING ${PRODUCT_COLUMNS}`,
     )
-      .bind(body.sku_name, body.unit, body.suggested_price ?? null, body.cost_price ?? null, session.username)
+      .bind(body.sku_name, body.unit, body.suggested_price ?? null, body.cost_price ?? null, session.sub)
       .first<ProductRow>()
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -461,7 +767,7 @@ async function handleUpdateProduct(
         body.unit,
         body.suggested_price ?? null,
         body.cost_price ?? null,
-        session.username,
+        session.sub,
       ),
     ])
     product = insertResult.results[0] ?? null
@@ -488,8 +794,9 @@ async function handleGetProductHistory(
   )
     .bind(skuId)
     .all<ProductRow & { row_increment: number; is_active: number }>()
+  const history = await hydrateUserNames(env, results, ['updated_by'])
 
-  return json({ history: results })
+  return json({ history })
 }
 
 async function handleDeleteProduct(
@@ -1335,7 +1642,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
         `INSERT INTO customer (customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at, is_active)
          SELECT COALESCE(MAX(customer_id), 0) + 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM customer`,
       )
-        .bind(body.company_name, body.company_address ?? null, contactName, phoneNumber, session.username)
+        .bind(body.company_name, body.company_address ?? null, contactName, phoneNumber, session.sub)
         .run()
       customer = {
         customer_id: created.meta.last_row_id,
@@ -1358,7 +1665,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
           customer.address,
           contactName,
           phoneNumber,
-          session.username,
+          session.sub,
         ),
       ])
       customer = { ...customer, contact_person: contactName, phone_number: phoneNumber }
@@ -1405,7 +1712,7 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
           `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
            SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
         )
-          .bind(raw.sku_name, raw.unit, raw.price, session.username)
+          .bind(raw.sku_name, raw.unit, raw.price, session.sub)
           .run()
         skuId = created.meta.last_row_id
       }
@@ -1542,6 +1849,35 @@ export default {
       return handleMe(request, effectiveEnv)
     }
 
+    if (url.pathname === '/auth/account' && request.method === 'PUT') {
+      return handleUpdateAccount(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/auth/password' && request.method === 'PUT') {
+      return handleUpdatePassword(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/users' && request.method === 'GET') {
+      return handleListUsers(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/users' && request.method === 'POST') {
+      return handleCreateUser(request, effectiveEnv)
+    }
+
+    const userIdMatch = url.pathname.match(/^\/users\/([0-9a-f-]+)$/)
+    if (userIdMatch && request.method === 'PUT') {
+      return handleUpdateUserRole(request, effectiveEnv, userIdMatch[1])
+    }
+    if (userIdMatch && request.method === 'DELETE') {
+      return handleDeactivateUser(request, effectiveEnv, userIdMatch[1])
+    }
+
+    const userResetPasswordMatch = url.pathname.match(/^\/users\/([0-9a-f-]+)\/reset-password$/)
+    if (userResetPasswordMatch && request.method === 'POST') {
+      return handleResetUserPassword(request, effectiveEnv, userResetPasswordMatch[1])
+    }
+
     if (url.pathname === '/customers' && request.method === 'GET') {
       return handleListCustomers(request, effectiveEnv)
     }
@@ -1645,6 +1981,13 @@ export default {
 
     if (url.pathname === '/stock-ledger' && request.method === 'POST') {
       return handleCreateStockMovement(request, effectiveEnv)
+    }
+
+    const stockLedgerIdMatch = url.pathname.match(/^\/stock-ledger\/(\d+)$/)
+    if (stockLedgerIdMatch) {
+      const id = Number(stockLedgerIdMatch[1])
+      if (request.method === 'PUT') return handleUpdateStockMovement(request, effectiveEnv, id)
+      if (request.method === 'DELETE') return handleDeleteStockMovement(request, effectiveEnv, id)
     }
 
     if (url.pathname === '/business' && request.method === 'GET') {
