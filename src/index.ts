@@ -416,7 +416,9 @@ async function handleListStockLedger(request: Request, env: Env): Promise<Respon
      UNION ALL
      SELECT 'sale' AS kind, ni.nota_item_id AS id, ni.sku_id,
       (SELECT sku_name FROM product WHERE sku_id = ni.sku_id AND is_active = 1) AS item_name,
-      n.nota_date AS date, 'sale' AS movement_type, -ni.qty AS qty, NULL AS note, n.created_by,
+      n.nota_date AS date, 'sale' AS movement_type, -ni.qty AS qty,
+      ('Penjualan ke ' || n.customer_company_name_snapshot || ' - No. Invoce: ' || n.nota_number) AS note,
+      n.created_by,
       n.created_at, NULL AS updated_by, NULL AS updated_at, n.nota_number AS invoice_number
      FROM nota_item ni
      JOIN nota n ON n.nota_id = ni.nota_id
