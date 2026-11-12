@@ -322,6 +322,22 @@ async function requireAuth(request: Request, env: Env) {
   return verifySession(token, env.JWT_SECRET)
 }
 
+// admin/staging_admin never see cost/profit figures -- the dashboard hides
+// the columns, but that's cosmetic unless the API itself withholds them too
+// (otherwise anyone on that role can just read the network response).
+function hideFinancials(role: string): boolean {
+  return role === 'admin' || role === 'staging_admin'
+}
+
+function redactFinancials<T extends object>(role: string, rows: T[], fields: (keyof T)[]): T[] {
+  if (!hideFinancials(role)) return rows
+  return rows.map((row) => {
+    const redacted = { ...row } as Record<string, unknown>
+    for (const field of fields) delete redacted[field as string]
+    return redacted as T
+  })
+}
+
 interface ProductRow {
   sku_id: number
   sku_name: string
@@ -337,7 +353,8 @@ const PRODUCT_COLUMNS = 'sku_id, sku_name, unit, suggested_price, cost_price, up
 // total_revenue is a correlated subquery, not a plain column, so it's kept out of
 // PRODUCT_COLUMNS (which is reused for INSERT/UPDATE ... RETURNING elsewhere).
 async function handleListProducts(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const limitParam = new URL(request.url).searchParams.get('limit')
   const limit = limitParam ? Math.max(1, Math.min(500, Number(limitParam) || 0)) : null
@@ -363,8 +380,9 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   const { results } = await stmt.all<
     ProductRow & { total_revenue: number; total_cost: number; current_stock: number | null }
   >()
+  const redacted = redactFinancials(session.role, results, ['cost_price', 'total_revenue', 'total_cost'])
 
-  return json({ products: results })
+  return json({ products: redacted })
 }
 
 const MOVEMENT_TYPES = [
@@ -575,7 +593,8 @@ const CUSTOMER_COLUMNS =
   'customer_id, company_name, address, contact_person, phone_number, updated_by, updated_at'
 
 async function handleListCustomers(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const limitParam = new URL(request.url).searchParams.get('limit')
   const limit = limitParam ? Math.max(1, Math.min(500, Number(limitParam) || 0)) : null
@@ -591,8 +610,9 @@ async function handleListCustomers(request: Request, env: Env): Promise<Response
     ? env.DB.prepare(`${base} ORDER BY customer_id DESC LIMIT ?`).bind(limit)
     : env.DB.prepare(`${base} ORDER BY customer_id ASC`)
   const { results } = await stmt.all<CustomerRow & { total_revenue: number; total_cost: number }>()
+  const redacted = redactFinancials(session.role, results, ['total_revenue', 'total_cost'])
 
-  return json({ customers: results })
+  return json({ customers: redacted })
 }
 
 function isUniqueConstraintError(err: unknown): boolean {
@@ -850,7 +870,8 @@ async function handleGetProductHistory(
   env: Env,
   skuId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const { results } = await env.DB.prepare(
     `SELECT history_id AS row_increment, sku_id, sku_name, unit, suggested_price, cost_price,
@@ -859,7 +880,8 @@ async function handleGetProductHistory(
   )
     .bind(skuId)
     .all<ProductRow & { row_increment: number; is_active: number }>()
-  const history = await hydrateUserNames(env, results, ['updated_by'])
+  const hydrated = await hydrateUserNames(env, results, ['updated_by'])
+  const history = redactFinancials(session.role, hydrated, ['cost_price'])
 
   return json({ history })
 }
@@ -1177,6 +1199,7 @@ interface NotaListRow {
   status: string
   pajak_name: string | null
   pajak_percentage: number | null
+  created_by: string | null
 }
 
 // Payment is scoped to the bill (customer + month), so every nota in a bill shows the
@@ -1198,7 +1221,8 @@ const BILL_STATUS = `CASE
      END`
 
 async function handleListNota(request: Request, env: Env): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const url = new URL(request.url)
   const limitParam = url.searchParams.get('limit')
@@ -1258,7 +1282,7 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
     .first<{ count: number }>()
 
   const baseQuery = `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_id, n.customer_company_name_snapshot,
-            n.contact_name_snapshot, n.notes, n.pajak_name, n.pajak_percentage, s.total_price, s.paid_amount, ${BILL_STATUS} AS status,
+            n.contact_name_snapshot, n.notes, n.pajak_name, n.pajak_percentage, n.created_by, s.total_price, s.paid_amount, ${BILL_STATUS} AS status,
             (SELECT COALESCE(SUM(ni.cost_price_snapshot * ni.qty), 0) FROM nota_item ni WHERE ni.nota_id = n.nota_id) AS total_cost
      FROM nota n
      ${BILL_JOINS}
@@ -1269,8 +1293,10 @@ async function handleListNota(request: Request, env: Env): Promise<Response> {
     ? env.DB.prepare(`${baseQuery} LIMIT ? OFFSET ?`).bind(...params, limit, offset)
     : env.DB.prepare(baseQuery).bind(...params)
   const { results } = await stmt.all<NotaListRow>()
+  const hydrated = await hydrateUserNames(env, results, ['created_by'])
+  const redacted = redactFinancials(session.role, hydrated, ['total_cost'])
 
-  return json({ nota: results, total: totalRow?.count ?? results.length })
+  return json({ nota: redacted, total: totalRow?.count ?? results.length })
 }
 
 async function handleGetNotaDateRange(request: Request, env: Env): Promise<Response> {
@@ -1597,7 +1623,8 @@ async function handleGetNota(
   env: Env,
   notaId: number,
 ): Promise<Response> {
-  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const nota = await env.DB.prepare(
     `SELECT n.nota_id, n.nota_number, n.nota_date, n.customer_company_name_snapshot,
@@ -1620,8 +1647,9 @@ async function handleGetNota(
   )
     .bind(notaId)
     .all<NotaItemRow>()
+  const redactedItems = redactFinancials(session.role, items, ['cost_price_snapshot'])
 
-  return json({ nota: { ...nota, items } })
+  return json({ nota: { ...nota, items: redactedItems } })
 }
 
 interface UpdateNotaBody {
