@@ -380,7 +380,11 @@ async function handleListProducts(request: Request, env: Env): Promise<Response>
   const { results } = await stmt.all<
     ProductRow & { total_revenue: number; total_cost: number; current_stock: number | null }
   >()
-  const redacted = redactFinancials(session.role, results, ['cost_price', 'total_revenue', 'total_cost'])
+  // has_cost_price survives redaction -- nota creation needs to know whether
+  // the owner has filled in a cost, without admin/staging_admin seeing the
+  // actual cost_price value.
+  const withFlag = results.map((row) => ({ ...row, has_cost_price: row.cost_price != null }))
+  const redacted = redactFinancials(session.role, withFlag, ['cost_price', 'total_revenue', 'total_cost'])
 
   return json({ products: redacted })
 }
