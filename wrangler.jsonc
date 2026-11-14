@@ -31,5 +31,39 @@
       "binding": "ASSETS",
       "bucket_name": "rds-factory-management-assets"
     }
-  ]
+  ],
+  // Separate deploy target for this branch's own Cloudflare Worker
+  // (staging-rds-worker), so it never shares identity or config with the
+  // production worker above. DB is pinned directly to the staging clone --
+  // not swapped by role like the default env -- so this deployment can
+  // never reach production data no matter who's logged in.
+  // Workers Builds project for this target must run `wrangler deploy --env staging`.
+  "env": {
+    "staging": {
+      "name": "staging-rds-worker",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "staging_rds_factory_management",
+          "database_id": "219615f0-f65b-4605-a318-9d228126fb9c"
+        },
+        {
+          "binding": "DB_STAGING",
+          "database_name": "staging_rds_factory_management",
+          "database_id": "219615f0-f65b-4605-a318-9d228126fb9c"
+        },
+        {
+          "binding": "USER_DB",
+          "database_name": "user_accounts",
+          "database_id": "c9b02f5e-88cc-4323-ad85-c5c7956466d2"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "ASSETS",
+          "bucket_name": "rds-factory-management-assets"
+        }
+      ]
+    }
+  }
 }
