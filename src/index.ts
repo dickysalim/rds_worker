@@ -15,7 +15,10 @@ export interface Env {
   STAGING_LOCKED?: string
 }
 
-const STAGING_ONLY_ROLES = new Set(['test_owner', 'test_admin'])
+// super_admin is allowed to log in on the locked deployment too -- the DB
+// swap above still forces DB_STAGING unconditionally regardless of role, so
+// super_admin can only ever see/touch staging data here.
+const STAGING_ONLY_ROLES = new Set(['test_owner', 'test_admin', 'super_admin'])
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
