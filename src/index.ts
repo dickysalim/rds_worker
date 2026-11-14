@@ -204,7 +204,7 @@ async function handleListUsers(request: Request, env: Env): Promise<Response> {
   if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
 
   const { results } = await env.USER_DB.prepare(
-    "SELECT user_id, username, name, role FROM user WHERE role NOT IN ('super_admin', 'staging_admin') AND is_active = 1 ORDER BY username",
+    "SELECT user_id, username, name, role FROM user WHERE role NOT IN ('super_admin', 'staging_admin', 'test_owner', 'test_admin') AND is_active = 1 ORDER BY username",
   ).all<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
 
   return json({ users: results })
@@ -254,7 +254,8 @@ async function requireManageableUser(env: Env, userId: string): Promise<UserRow 
   )
     .bind(userId)
     .first<UserRow>()
-  if (!user || user.role === 'super_admin' || user.role === 'staging_admin') return null
+  if (!user || user.role === 'super_admin' || user.role === 'staging_admin' || user.role === 'test_owner' || user.role === 'test_admin')
+    return null
   return user
 }
 
@@ -2462,11 +2463,15 @@ export default {
     // (everything below) at the staging clone instead of production. Only
     // auth (USER_DB) and JWT_SECRET are unaffected, since those live outside
     // the swapped `DB` binding.
+    // test_owner/test_admin are forced onto staging unconditionally -- no
+    // header, no toggle, so there's no way for them to reach production.
     const sessionToken = getBearerToken(request)
     const session = sessionToken ? await verifySession(sessionToken, env.JWT_SECRET) : null
     const useStaging =
-      (session?.role === 'super_admin' || session?.role === 'staging_admin') &&
-      request.headers.get('X-Db-Target') === 'staging'
+      session?.role === 'test_owner' ||
+      session?.role === 'test_admin' ||
+      ((session?.role === 'super_admin' || session?.role === 'staging_admin') &&
+        request.headers.get('X-Db-Target') === 'staging')
     const effectiveEnv: Env = useStaging ? { ...env, DB: env.DB_STAGING } : env
 
     if (url.pathname === '/auth/login' && request.method === 'POST') {
