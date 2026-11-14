@@ -7,7 +7,15 @@ export interface Env {
   USER_DB: D1Database
   JWT_SECRET: string
   ASSETS: R2Bucket
+  // Set only on the `staging` wrangler env (unreleased-feature's isolated
+  // deploy target) -- forces every request onto DB_STAGING and blocks
+  // non-test accounts from logging in at all, so this deployment can never
+  // touch or expose production data. Unset on the default/prod deploy, so
+  // merging this branch to main changes no behavior there.
+  STAGING_LOCKED?: string
 }
+
+const STAGING_ONLY_ROLES = new Set(['test_owner', 'test_admin'])
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
@@ -106,6 +114,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     .first<UserRow>()
 
   if (!user || !user.is_active) {
+    return json({ error: 'Invalid username or password' }, { status: 401 })
+  }
+
+  if (env.STAGING_LOCKED === 'true' && !STAGING_ONLY_ROLES.has(user.role)) {
     return json({ error: 'Invalid username or password' }, { status: 401 })
   }
 
@@ -2468,6 +2480,7 @@ export default {
     const sessionToken = getBearerToken(request)
     const session = sessionToken ? await verifySession(sessionToken, env.JWT_SECRET) : null
     const useStaging =
+      env.STAGING_LOCKED === 'true' ||
       session?.role === 'test_owner' ||
       session?.role === 'test_admin' ||
       ((session?.role === 'super_admin' || session?.role === 'staging_admin') &&

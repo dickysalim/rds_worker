@@ -63,7 +63,13 @@
           "binding": "ASSETS",
           "bucket_name": "rds-factory-management-assets"
         }
-      ]
+      ],
+      // Forces every request onto DB_STAGING and blocks non-test accounts
+      // from logging in (see Env.STAGING_LOCKED in src/index.ts). Only set
+      // here, never on the default/prod config above.
+      "vars": {
+        "STAGING_LOCKED": "true"
+      }
     }
   }
 }
