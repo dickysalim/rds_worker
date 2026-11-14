@@ -940,7 +940,12 @@ async function handleCreateRawMaterial(request: Request, env: Env): Promise<Resp
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request
-    .json<{ raw_mat_sku_name?: string; unit?: string; initial_stock?: number | null }>()
+    .json<{
+      raw_mat_sku_name?: string
+      unit?: string
+      initial_stock?: number | null
+      current_price?: number | null
+    }>()
     .catch(() => null)
   if (!body?.raw_mat_sku_name || !body.unit) {
     return json({ error: 'raw_mat_sku_name and unit are required' }, { status: 400 })
@@ -975,10 +980,10 @@ async function handleCreateRawMaterial(request: Request, env: Env): Promise<Resp
       rawMaterial = rawMaterialResult.results[0] ?? null
       if (rawMaterial) {
         await env.DB.prepare(
-          `INSERT INTO raw_material_ledger (raw_mat_id, date, movement_type, qty, note, created_by)
-           VALUES (?, date('now'), 'purchase_in', ?, 'Initial stock on material creation', ?)`,
+          `INSERT INTO raw_material_ledger (raw_mat_id, date, movement_type, qty, note, price, created_by)
+           VALUES (?, date('now'), 'initial_stock', ?, 'Initial stock on material creation', ?, ?)`,
         )
-          .bind(rawMaterial.raw_mat_id, initialStock, session.sub)
+          .bind(rawMaterial.raw_mat_id, initialStock, body.current_price ?? null, session.sub)
           .run()
       }
     } else {
@@ -1076,8 +1081,19 @@ async function handleDeleteRawMaterial(
   return json({ ok: true })
 }
 
-const RAW_MATERIAL_MOVEMENT_TYPES = ['purchase_in', 'out_for_production', 'retur', 'stock_loss']
-const RAW_MATERIAL_MOVEMENT_MINUS_TYPES = ['out_for_production', 'retur', 'stock_loss']
+const RAW_MATERIAL_MOVEMENT_TYPES = [
+  'purchase_in',
+  'out_for_production',
+  'retur',
+  'stock_loss',
+  'initial_stock',
+  'adjustment_up',
+  'adjustment_down',
+]
+const RAW_MATERIAL_MOVEMENT_MINUS_TYPES = ['out_for_production', 'retur', 'stock_loss', 'adjustment_down']
+// Only these two carry a price -- initial_stock is a stock-in event just
+// like purchase_in, the rest (out/retur/loss/adjustments) never have one.
+const RAW_MATERIAL_MOVEMENT_PRICED_TYPES = ['purchase_in', 'initial_stock']
 
 interface RawMaterialLedgerRow {
   id: number
@@ -1184,7 +1200,7 @@ async function handleCreateRawMaterialMovement(request: Request, env: Env): Prom
       body.note || null,
       body.purchase_order_id ?? null,
       body.movement_type === 'purchase_in' ? body.purchase_order_freetext?.trim() || null : null,
-      body.movement_type === 'purchase_in' ? (body.price ?? null) : null,
+      RAW_MATERIAL_MOVEMENT_PRICED_TYPES.includes(body.movement_type) ? (body.price ?? null) : null,
       session.sub,
     )
     .first<Omit<RawMaterialLedgerRow, 'item_name'>>()
@@ -1248,7 +1264,7 @@ async function handleUpdateRawMaterialMovement(request: Request, env: Env, id: n
       body.note || null,
       body.purchase_order_id ?? null,
       body.movement_type === 'purchase_in' ? body.purchase_order_freetext?.trim() || null : null,
-      body.movement_type === 'purchase_in' ? (body.price ?? null) : null,
+      RAW_MATERIAL_MOVEMENT_PRICED_TYPES.includes(body.movement_type) ? (body.price ?? null) : null,
       session.sub,
       id,
     )
@@ -1317,16 +1333,15 @@ interface CreatePurchaseOrderBody {
 // movement_type = 'purchase_in' (see 0037's migration note), so this never
 // needs a stock-sufficiency check the way a deduction would.
 //
-// Vendor linkage and notes are on hold until the Purchase Order module
-// exists (see 0038/0039) -- po_number is just a plain optional text field
-// for now.
+// Vendor linkage is on hold until the Purchase Order module exists (see
+// 0038/0039) -- po_number is just a plain required text field for now.
 async function handleCreatePurchaseOrder(request: Request, env: Env): Promise<Response> {
   const session = await requireAuth(request, env)
   if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
 
   const body = await request.json<CreatePurchaseOrderBody>().catch(() => null)
-  if (!body?.po_date || !body.items?.length) {
-    return json({ error: 'po_date and at least one item are required' }, { status: 400 })
+  if (!body?.po_date || !body.po_number?.trim() || !body.items?.length) {
+    return json({ error: 'po_date, po_number and at least one item are required' }, { status: 400 })
   }
   for (const raw of body.items) {
     if (!raw.raw_mat_sku_name || !raw.unit || !raw.qty || raw.qty <= 0) {
@@ -1338,25 +1353,18 @@ async function handleCreatePurchaseOrder(request: Request, env: Env): Promise<Re
   for (const raw of body.items) {
     let rawMatId = raw.raw_mat_id ?? null
     if (rawMatId == null) {
-      // Case-insensitive match so a differently-cased retype reuses the
-      // existing row instead of creating a near-duplicate.
+      // Case-insensitive match -- no inline-create here, the raw material
+      // must already exist (added via Raw Material Management).
       const existing = await env.DB.prepare(
         "SELECT raw_mat_id FROM raw_material WHERE is_active = 1 AND lower(trim(raw_mat_sku_name)) = lower(trim(?))",
       )
         .bind(raw.raw_mat_sku_name)
         .first<{ raw_mat_id: number }>()
 
-      if (existing) {
-        rawMatId = existing.raw_mat_id
-      } else {
-        const created = await env.DB.prepare(
-          `INSERT INTO raw_material (raw_mat_id, raw_mat_sku_name, unit, updated_by, updated_at, is_active)
-           SELECT COALESCE(MAX(raw_mat_id), 0) + 1, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM raw_material`,
-        )
-          .bind(raw.raw_mat_sku_name, raw.unit, session.sub)
-          .run()
-        rawMatId = created.meta.last_row_id
+      if (!existing) {
+        return json({ error: `Raw material "${raw.raw_mat_sku_name}" does not exist. Add it first.` }, { status: 400 })
       }
+      rawMatId = existing.raw_mat_id
     }
     items.push({
       raw_mat_id: rawMatId,
@@ -2308,23 +2316,17 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
 
     let skuId = raw.sku_id ?? null
     if (skuId == null) {
+      // No inline-create here, the product must already exist.
       const existingProduct = await env.DB.prepare(
-        'SELECT sku_id FROM product WHERE sku_name = ? AND is_active = 1',
+        'SELECT sku_id FROM product WHERE lower(trim(sku_name)) = lower(trim(?)) AND is_active = 1',
       )
         .bind(raw.sku_name)
         .first<{ sku_id: number }>()
 
-      if (existingProduct) {
-        skuId = existingProduct.sku_id
-      } else {
-        const created = await env.DB.prepare(
-          `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-           SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
-        )
-          .bind(raw.sku_name, raw.unit, raw.price, session.sub)
-          .run()
-        skuId = created.meta.last_row_id
+      if (!existingProduct) {
+        return json({ error: `Product "${raw.sku_name}" does not exist. Add it first.` }, { status: 400 })
       }
+      skuId = existingProduct.sku_id
     }
 
     const qty = raw.qty
