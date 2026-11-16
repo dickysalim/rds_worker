@@ -7,7 +7,18 @@ export interface Env {
   USER_DB: D1Database
   JWT_SECRET: string
   ASSETS: R2Bucket
+  // Set only on the `staging` wrangler env (unreleased-feature's isolated
+  // deploy target) -- forces every request onto DB_STAGING and blocks
+  // non-test accounts from logging in at all, so this deployment can never
+  // touch or expose production data. Unset on the default/prod deploy, so
+  // merging this branch to main changes no behavior there.
+  STAGING_LOCKED?: string
 }
+
+// super_admin is allowed to log in on the locked deployment too -- the DB
+// swap above still forces DB_STAGING unconditionally regardless of role, so
+// super_admin can only ever see/touch staging data here.
+const STAGING_ONLY_ROLES = new Set(['test_owner', 'test_admin', 'super_admin'])
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
@@ -109,6 +120,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     return json({ error: 'Invalid username or password' }, { status: 401 })
   }
 
+  if (env.STAGING_LOCKED === 'true' && !STAGING_ONLY_ROLES.has(user.role)) {
+    return json({ error: 'Invalid username or password' }, { status: 401 })
+  }
+
   const valid = await bcrypt.compare(body.password, user.password_hash)
   if (!valid) {
     return json({ error: 'Invalid username or password' }, { status: 401 })
@@ -204,7 +219,7 @@ async function handleListUsers(request: Request, env: Env): Promise<Response> {
   if (session.role !== 'super_admin') return json({ error: 'Forbidden' }, { status: 403 })
 
   const { results } = await env.USER_DB.prepare(
-    "SELECT user_id, username, name, role FROM user WHERE role NOT IN ('super_admin', 'staging_admin') AND is_active = 1 ORDER BY username",
+    "SELECT user_id, username, name, role FROM user WHERE role NOT IN ('super_admin', 'staging_admin', 'test_owner', 'test_admin') AND is_active = 1 ORDER BY username",
   ).all<Pick<UserRow, 'user_id' | 'username' | 'name' | 'role'>>()
 
   return json({ users: results })
@@ -254,7 +269,8 @@ async function requireManageableUser(env: Env, userId: string): Promise<UserRow 
   )
     .bind(userId)
     .first<UserRow>()
-  if (!user || user.role === 'super_admin' || user.role === 'staging_admin') return null
+  if (!user || user.role === 'super_admin' || user.role === 'staging_admin' || user.role === 'test_owner' || user.role === 'test_admin')
+    return null
   return user
 }
 
@@ -905,6 +921,490 @@ async function handleDeleteProduct(
     .run()
 
   return json({ ok: true })
+}
+
+interface RawMaterialRow {
+  raw_mat_id: number
+  raw_mat_sku_name: string
+  unit: string
+  updated_by: string | null
+  updated_at: string
+}
+
+const RAW_MATERIAL_COLUMNS = 'raw_mat_id, raw_mat_sku_name, unit, updated_by, updated_at'
+
+async function handleListRawMaterials(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const limitParam = new URL(request.url).searchParams.get('limit')
+  const limit = limitParam ? Math.max(1, Math.min(500, Number(limitParam) || 0)) : null
+
+  const base = `SELECT ${RAW_MATERIAL_COLUMNS},
+      (SELECT COALESCE(SUM(rl.qty), 0) FROM raw_material_ledger rl
+       WHERE rl.raw_mat_id = raw_material.raw_mat_id AND rl.is_active = 1) AS current_stock
+     FROM raw_material WHERE is_active = 1`
+  const stmt = limit
+    ? env.DB.prepare(`${base} ORDER BY raw_mat_id DESC LIMIT ?`).bind(limit)
+    : env.DB.prepare(`${base} ORDER BY raw_mat_id ASC`)
+  const { results } = await stmt.all<RawMaterialRow & { current_stock: number }>()
+
+  return json({ raw_materials: results })
+}
+
+async function handleCreateRawMaterial(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      raw_mat_sku_name?: string
+      unit?: string
+      initial_stock?: number | null
+      current_price?: number | null
+    }>()
+    .catch(() => null)
+  if (!body?.raw_mat_sku_name || !body.unit) {
+    return json({ error: 'raw_mat_sku_name and unit are required' }, { status: 400 })
+  }
+
+  // The unique index is case-sensitive, so it alone would let "Tepung" and
+  // "tepung" coexist -- check case-insensitively here so names collide the
+  // way a human reading the list would expect.
+  const duplicate = await env.DB.prepare(
+    "SELECT raw_mat_id FROM raw_material WHERE is_active = 1 AND lower(trim(raw_mat_sku_name)) = lower(trim(?))",
+  )
+    .bind(body.raw_mat_sku_name)
+    .first<{ raw_mat_id: number }>()
+  if (duplicate) {
+    return json({ error: 'A raw material with this name already exists' }, { status: 409 })
+  }
+
+  const initialStock = body.initial_stock ?? 0
+
+  let rawMaterial: RawMaterialRow | null
+  try {
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    const insertRawMaterial = env.DB.prepare(
+      `INSERT INTO raw_material (raw_mat_id, raw_mat_sku_name, unit, updated_by, updated_at, is_active)
+       SELECT COALESCE(MAX(raw_mat_id), 0) + 1, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM raw_material
+       RETURNING ${RAW_MATERIAL_COLUMNS}`,
+    ).bind(body.raw_mat_sku_name, body.unit, session.sub)
+
+    if (initialStock > 0) {
+      const [rawMaterialResult] = await env.DB.batch<RawMaterialRow>([insertRawMaterial])
+      rawMaterial = rawMaterialResult.results[0] ?? null
+      if (rawMaterial) {
+        await env.DB.prepare(
+          `INSERT INTO raw_material_ledger (raw_mat_id, date, movement_type, qty, note, price, created_by)
+           VALUES (?, date('now'), 'initial_stock', ?, 'Initial stock on material creation', ?, ?)`,
+        )
+          .bind(rawMaterial.raw_mat_id, initialStock, body.current_price ?? null, session.sub)
+          .run()
+      }
+    } else {
+      rawMaterial = await insertRawMaterial.first<RawMaterialRow>()
+    }
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A raw material with this SKU name already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  return json({ raw_material: rawMaterial }, { status: 201 })
+}
+
+async function handleUpdateRawMaterial(
+  request: Request,
+  env: Env,
+  rawMatId: number,
+): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<{ raw_mat_sku_name?: string; unit?: string }>().catch(() => null)
+  if (!body?.raw_mat_sku_name || !body.unit) {
+    return json({ error: 'raw_mat_sku_name and unit are required' }, { status: 400 })
+  }
+
+  const duplicate = await env.DB.prepare(
+    "SELECT raw_mat_id FROM raw_material WHERE is_active = 1 AND raw_mat_id != ? AND lower(trim(raw_mat_sku_name)) = lower(trim(?))",
+  )
+    .bind(rawMatId, body.raw_mat_sku_name)
+    .first<{ raw_mat_id: number }>()
+  if (duplicate) {
+    return json({ error: 'A raw material with this name already exists' }, { status: 409 })
+  }
+
+  let rawMaterial: RawMaterialRow | null
+  try {
+    // RETURNING reads back the just-written row instead of a follow-up SELECT,
+    // which can race against D1's read replicas and see a stale (missing) row.
+    // The raw_material_history trigger captures this update, so this is a
+    // plain in-place UPDATE, not an append.
+    rawMaterial = await env.DB.prepare(
+      `UPDATE raw_material SET raw_mat_sku_name = ?, unit = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE raw_mat_id = ? AND is_active = 1
+       RETURNING ${RAW_MATERIAL_COLUMNS}`,
+    )
+      .bind(body.raw_mat_sku_name, body.unit, session.sub, rawMatId)
+      .first<RawMaterialRow>()
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return json({ error: 'A raw material with this SKU name already exists' }, { status: 409 })
+    }
+    throw err
+  }
+
+  if (!rawMaterial) return json({ error: 'Not found' }, { status: 404 })
+  return json({ raw_material: rawMaterial })
+}
+
+async function handleGetRawMaterialHistory(
+  request: Request,
+  env: Env,
+  rawMatId: number,
+): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT history_id AS row_increment, raw_mat_id, raw_mat_sku_name, unit,
+            changed_by AS updated_by, changed_at AS updated_at, is_active
+     FROM raw_material_history WHERE raw_mat_id = ? ORDER BY history_id DESC`,
+  )
+    .bind(rawMatId)
+    .all<RawMaterialRow & { row_increment: number; is_active: number }>()
+  const history = await hydrateUserNames(env, results, ['updated_by'])
+
+  return json({ history })
+}
+
+async function handleDeleteRawMaterial(
+  request: Request,
+  env: Env,
+  rawMatId: number,
+): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  await env.DB.prepare(
+    'UPDATE raw_material SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE raw_mat_id = ? AND is_active = 1',
+  )
+    .bind(session.sub, rawMatId)
+    .run()
+
+  return json({ ok: true })
+}
+
+const RAW_MATERIAL_MOVEMENT_TYPES = [
+  'purchase_in',
+  'out_for_production',
+  'retur',
+  'stock_loss',
+  'initial_stock',
+  'adjustment_up',
+  'adjustment_down',
+]
+const RAW_MATERIAL_MOVEMENT_MINUS_TYPES = ['out_for_production', 'retur', 'stock_loss', 'adjustment_down']
+// Only these two carry a price -- initial_stock is a stock-in event just
+// like purchase_in, the rest (out/retur/loss/adjustments) never have one.
+const RAW_MATERIAL_MOVEMENT_PRICED_TYPES = ['purchase_in', 'initial_stock']
+
+interface RawMaterialLedgerRow {
+  id: number
+  raw_mat_id: number
+  item_name: string
+  date: string
+  movement_type: string
+  qty: number
+  note: string | null
+  purchase_order_id: number | null
+  purchase_order_freetext: string | null
+  price: number | null
+  created_by: string | null
+  created_at: string
+  updated_by: string | null
+  updated_at: string | null
+}
+
+// Same formula as handleListRawMaterials' current_stock column -- the one
+// source of truth for "how much of this material is left", used to guard
+// every stock deduction below against going negative.
+async function getCurrentRawMaterialStock(env: Env, rawMatId: number): Promise<number> {
+  const row = await env.DB.prepare(
+    'SELECT COALESCE(SUM(qty), 0) AS current_stock FROM raw_material_ledger WHERE raw_mat_id = ? AND is_active = 1',
+  )
+    .bind(rawMatId)
+    .first<{ current_stock: number }>()
+  return row?.current_stock ?? 0
+}
+
+async function handleListRawMaterialLedger(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const limitParam = new URL(request.url).searchParams.get('limit')
+  const limit = limitParam ? Math.max(1, Math.min(2000, Number(limitParam) || 0)) : null
+
+  const base = `SELECT rl.id, rl.raw_mat_id,
+      (SELECT raw_mat_sku_name FROM raw_material WHERE raw_mat_id = rl.raw_mat_id AND is_active = 1) AS item_name,
+      rl.date, rl.movement_type, rl.qty, rl.note, rl.purchase_order_id, rl.purchase_order_freetext, rl.price,
+      rl.created_by, rl.created_at, rl.updated_by, rl.updated_at
+     FROM raw_material_ledger rl
+     WHERE rl.is_active = 1`
+  const stmt = limit
+    ? env.DB.prepare(`${base} ORDER BY rl.date DESC, rl.created_at DESC LIMIT ?`).bind(limit)
+    : env.DB.prepare(`${base} ORDER BY rl.date DESC, rl.created_at DESC`)
+  const { results } = await stmt.all<RawMaterialLedgerRow>()
+  const hydrated = await hydrateUserNames(env, results, ['created_by', 'updated_by'])
+  // price is the rate paid to the vendor -- same sensitivity as
+  // product.cost_price, so it's withheld from admin/staging_admin here too.
+  const entries = redactFinancials(session.role, hydrated, ['price'])
+
+  return json({ entries })
+}
+
+async function handleCreateRawMaterialMovement(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      raw_mat_id?: number
+      date?: string
+      movement_type?: string
+      qty?: number
+      note?: string | null
+      price?: number | null
+      purchase_order_id?: number | null
+      purchase_order_freetext?: string | null
+    }>()
+    .catch(() => null)
+
+  if (!body?.raw_mat_id || !body.date || !body.movement_type || body.qty == null) {
+    return json({ error: 'raw_mat_id, date, movement_type, and qty are required' }, { status: 400 })
+  }
+  if (!RAW_MATERIAL_MOVEMENT_TYPES.includes(body.movement_type)) {
+    return json({ error: 'Invalid movement_type' }, { status: 400 })
+  }
+  const magnitude = Math.abs(Number(body.qty))
+  if (!magnitude) {
+    return json({ error: 'qty must be non-zero' }, { status: 400 })
+  }
+  // Every movement_type carries a fixed sign (table CHECK enforces it); the
+  // caller sends an unsigned magnitude, so sign it here.
+  const signedQty = RAW_MATERIAL_MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
+
+  if (signedQty < 0) {
+    const current = await getCurrentRawMaterialStock(env, body.raw_mat_id)
+    if (current + signedQty < 0) {
+      return json({ error: `Not enough stock: only ${current} available` }, { status: 400 })
+    }
+  }
+
+  const entry = await env.DB.prepare(
+    `INSERT INTO raw_material_ledger (raw_mat_id, date, movement_type, qty, note, purchase_order_id, purchase_order_freetext, price, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING id, raw_mat_id, date, movement_type, qty, note, purchase_order_id, purchase_order_freetext, price, created_by, created_at, updated_by, updated_at`,
+  )
+    .bind(
+      body.raw_mat_id,
+      body.date,
+      body.movement_type,
+      signedQty,
+      body.note || null,
+      body.purchase_order_id ?? null,
+      body.movement_type === 'purchase_in' ? body.purchase_order_freetext?.trim() || null : null,
+      RAW_MATERIAL_MOVEMENT_PRICED_TYPES.includes(body.movement_type) ? (body.price ?? null) : null,
+      session.sub,
+    )
+    .first<Omit<RawMaterialLedgerRow, 'item_name'>>()
+
+  return json({ entry }, { status: 201 })
+}
+
+async function handleUpdateRawMaterialMovement(request: Request, env: Env, id: number): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request
+    .json<{
+      date?: string
+      movement_type?: string
+      qty?: number
+      note?: string | null
+      price?: number | null
+      purchase_order_id?: number | null
+      purchase_order_freetext?: string | null
+    }>()
+    .catch(() => null)
+
+  if (!body?.date || !body.movement_type || body.qty == null) {
+    return json({ error: 'date, movement_type, and qty are required' }, { status: 400 })
+  }
+  if (!RAW_MATERIAL_MOVEMENT_TYPES.includes(body.movement_type)) {
+    return json({ error: 'Invalid movement_type' }, { status: 400 })
+  }
+  const magnitude = Math.abs(Number(body.qty))
+  if (!magnitude) {
+    return json({ error: 'qty must be non-zero' }, { status: 400 })
+  }
+  const signedQty = RAW_MATERIAL_MOVEMENT_MINUS_TYPES.includes(body.movement_type) ? -magnitude : magnitude
+
+  const existing = await env.DB.prepare(
+    'SELECT raw_mat_id, qty FROM raw_material_ledger WHERE id = ? AND is_active = 1',
+  )
+    .bind(id)
+    .first<{ raw_mat_id: number; qty: number }>()
+  if (!existing) return json({ error: 'Raw material ledger entry not found' }, { status: 404 })
+
+  if (signedQty < 0) {
+    const current = await getCurrentRawMaterialStock(env, existing.raw_mat_id)
+    const withoutThisRow = current - existing.qty
+    if (withoutThisRow + signedQty < 0) {
+      return json({ error: `Not enough stock: only ${withoutThisRow} available` }, { status: 400 })
+    }
+  }
+
+  const entry = await env.DB.prepare(
+    `UPDATE raw_material_ledger
+     SET date = ?, movement_type = ?, qty = ?, note = ?, purchase_order_id = ?, purchase_order_freetext = ?, price = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND is_active = 1
+     RETURNING id, raw_mat_id, date, movement_type, qty, note, purchase_order_id, purchase_order_freetext, price, created_by, created_at, updated_by, updated_at`,
+  )
+    .bind(
+      body.date,
+      body.movement_type,
+      signedQty,
+      body.note || null,
+      body.purchase_order_id ?? null,
+      body.movement_type === 'purchase_in' ? body.purchase_order_freetext?.trim() || null : null,
+      RAW_MATERIAL_MOVEMENT_PRICED_TYPES.includes(body.movement_type) ? (body.price ?? null) : null,
+      session.sub,
+      id,
+    )
+    .first<Omit<RawMaterialLedgerRow, 'item_name'>>()
+
+  if (!entry) return json({ error: 'Raw material ledger entry not found' }, { status: 404 })
+  return json({ entry })
+}
+
+// Soft delete only -- is_active flips to 0, row stays for the audit trail
+// (updated_by records who deleted it). Never a real DELETE.
+async function handleDeleteRawMaterialMovement(request: Request, env: Env, id: number): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const entry = await env.DB.prepare(
+    `UPDATE raw_material_ledger
+     SET is_active = 0, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND is_active = 1
+     RETURNING id`,
+  )
+    .bind(session.sub, id)
+    .first()
+
+  if (!entry) return json({ error: 'Raw material ledger entry not found' }, { status: 404 })
+  return json({ success: true })
+}
+
+interface VendorRow {
+  vendor_id: number
+  vendor_name: string
+  address: string | null
+  contact_person: string | null
+  phone_number: string | null
+  updated_by: string | null
+  updated_at: string
+}
+
+const VENDOR_COLUMNS = 'vendor_id, vendor_name, address, contact_person, phone_number, updated_by, updated_at'
+
+async function handleListVendors(request: Request, env: Env): Promise<Response> {
+  if (!(await requireAuth(request, env))) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { results } = await env.DB.prepare(
+    `SELECT ${VENDOR_COLUMNS} FROM vendor WHERE is_active = 1 ORDER BY vendor_id ASC`,
+  ).all<VendorRow>()
+
+  return json({ vendors: results })
+}
+
+interface CreatePurchaseOrderBody {
+  po_date?: string
+  po_number?: string | null
+  items?: Array<{
+    raw_mat_id?: number | null
+    raw_mat_sku_name?: string
+    unit?: string
+    qty?: number
+    price?: number | null
+    note?: string | null
+  }>
+}
+
+// The PO header is a plain record -- its line items are just
+// raw_material_ledger rows tagged with purchase_order_id and
+// movement_type = 'purchase_in' (see 0037's migration note), so this never
+// needs a stock-sufficiency check the way a deduction would.
+//
+// Vendor linkage is on hold until the Purchase Order module exists (see
+// 0038/0039) -- po_number is just a plain required text field for now.
+async function handleCreatePurchaseOrder(request: Request, env: Env): Promise<Response> {
+  const session = await requireAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await request.json<CreatePurchaseOrderBody>().catch(() => null)
+  if (!body?.po_date || !body.po_number?.trim() || !body.items?.length) {
+    return json({ error: 'po_date, po_number and at least one item are required' }, { status: 400 })
+  }
+  for (const raw of body.items) {
+    if (!raw.raw_mat_sku_name || !raw.unit || !raw.qty || raw.qty <= 0) {
+      return json({ error: 'Each item requires raw_mat_sku_name, unit and a positive qty' }, { status: 400 })
+    }
+  }
+
+  const items: Array<{ raw_mat_id: number; qty: number; price: number | null; note: string | null }> = []
+  for (const raw of body.items) {
+    let rawMatId = raw.raw_mat_id ?? null
+    if (rawMatId == null) {
+      // Case-insensitive match -- no inline-create here, the raw material
+      // must already exist (added via Raw Material Management).
+      const existing = await env.DB.prepare(
+        "SELECT raw_mat_id FROM raw_material WHERE is_active = 1 AND lower(trim(raw_mat_sku_name)) = lower(trim(?))",
+      )
+        .bind(raw.raw_mat_sku_name)
+        .first<{ raw_mat_id: number }>()
+
+      if (!existing) {
+        return json({ error: `Raw material "${raw.raw_mat_sku_name}" does not exist. Add it first.` }, { status: 400 })
+      }
+      rawMatId = existing.raw_mat_id
+    }
+    items.push({
+      raw_mat_id: rawMatId,
+      qty: raw.qty!,
+      price: raw.price ?? null,
+      note: raw.note?.trim() || null,
+    })
+  }
+
+  // No purchase_order header row yet -- the PO reference is just stored as
+  // free text on each ledger row until the real module links purchase_order_id.
+  const poFreetext = body.po_number?.trim() || null
+
+  const itemInsert = env.DB.prepare(
+    `INSERT INTO raw_material_ledger (raw_mat_id, date, movement_type, qty, note, purchase_order_freetext, price, created_by)
+     VALUES (?, ?, 'purchase_in', ?, ?, ?, ?, ?)`,
+  )
+  await env.DB.batch(
+    items.map((item) =>
+      itemInsert.bind(item.raw_mat_id, body.po_date, item.qty, item.note, poFreetext, item.price, session.sub),
+    ),
+  )
+
+  return json({ purchase_order: { po_date: body.po_date, po_number: poFreetext } }, { status: 201 })
 }
 
 interface BusinessRow {
@@ -1832,23 +2332,17 @@ async function handleCreateNota(request: Request, env: Env): Promise<Response> {
 
     let skuId = raw.sku_id ?? null
     if (skuId == null) {
+      // No inline-create here, the product must already exist.
       const existingProduct = await env.DB.prepare(
-        'SELECT sku_id FROM product WHERE sku_name = ? AND is_active = 1',
+        'SELECT sku_id FROM product WHERE lower(trim(sku_name)) = lower(trim(?)) AND is_active = 1',
       )
         .bind(raw.sku_name)
         .first<{ sku_id: number }>()
 
-      if (existingProduct) {
-        skuId = existingProduct.sku_id
-      } else {
-        const created = await env.DB.prepare(
-          `INSERT INTO product (sku_id, sku_name, unit, suggested_price, updated_by, updated_at, is_active)
-           SELECT COALESCE(MAX(sku_id), 0) + 1, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1 FROM product`,
-        )
-          .bind(raw.sku_name, raw.unit, raw.price, session.sub)
-          .run()
-        skuId = created.meta.last_row_id
+      if (!existingProduct) {
+        return json({ error: `Product "${raw.sku_name}" does not exist. Add it first.` }, { status: 400 })
       }
+      skuId = existingProduct.sku_id
     }
 
     const qty = raw.qty
@@ -1984,11 +2478,16 @@ export default {
     // (everything below) at the staging clone instead of production. Only
     // auth (USER_DB) and JWT_SECRET are unaffected, since those live outside
     // the swapped `DB` binding.
+    // test_owner/test_admin are forced onto staging unconditionally -- no
+    // header, no toggle, so there's no way for them to reach production.
     const sessionToken = getBearerToken(request)
     const session = sessionToken ? await verifySession(sessionToken, env.JWT_SECRET) : null
     const useStaging =
-      (session?.role === 'super_admin' || session?.role === 'staging_admin') &&
-      request.headers.get('X-Db-Target') === 'staging'
+      env.STAGING_LOCKED === 'true' ||
+      session?.role === 'test_owner' ||
+      session?.role === 'test_admin' ||
+      ((session?.role === 'super_admin' || session?.role === 'staging_admin') &&
+        request.headers.get('X-Db-Target') === 'staging')
     const effectiveEnv: Env = useStaging ? { ...env, DB: env.DB_STAGING } : env
 
     if (url.pathname === '/auth/login' && request.method === 'POST') {
@@ -2085,6 +2584,49 @@ export default {
     const productHistoryMatch = url.pathname.match(/^\/products\/(\d+)\/history$/)
     if (productHistoryMatch && request.method === 'GET') {
       return handleGetProductHistory(request, effectiveEnv, Number(productHistoryMatch[1]))
+    }
+
+    if (url.pathname === '/raw-materials' && request.method === 'GET') {
+      return handleListRawMaterials(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/raw-materials' && request.method === 'POST') {
+      return handleCreateRawMaterial(request, effectiveEnv)
+    }
+
+    const rawMaterialMatch = url.pathname.match(/^\/raw-materials\/(\d+)$/)
+    if (rawMaterialMatch) {
+      const rawMatId = Number(rawMaterialMatch[1])
+      if (request.method === 'PUT') return handleUpdateRawMaterial(request, effectiveEnv, rawMatId)
+      if (request.method === 'DELETE') return handleDeleteRawMaterial(request, effectiveEnv, rawMatId)
+    }
+
+    const rawMaterialHistoryMatch = url.pathname.match(/^\/raw-materials\/(\d+)\/history$/)
+    if (rawMaterialHistoryMatch && request.method === 'GET') {
+      return handleGetRawMaterialHistory(request, effectiveEnv, Number(rawMaterialHistoryMatch[1]))
+    }
+
+    if (url.pathname === '/raw-material-ledger' && request.method === 'GET') {
+      return handleListRawMaterialLedger(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/raw-material-ledger' && request.method === 'POST') {
+      return handleCreateRawMaterialMovement(request, effectiveEnv)
+    }
+
+    const rawMaterialLedgerIdMatch = url.pathname.match(/^\/raw-material-ledger\/(\d+)$/)
+    if (rawMaterialLedgerIdMatch) {
+      const id = Number(rawMaterialLedgerIdMatch[1])
+      if (request.method === 'PUT') return handleUpdateRawMaterialMovement(request, effectiveEnv, id)
+      if (request.method === 'DELETE') return handleDeleteRawMaterialMovement(request, effectiveEnv, id)
+    }
+
+    if (url.pathname === '/vendors' && request.method === 'GET') {
+      return handleListVendors(request, effectiveEnv)
+    }
+
+    if (url.pathname === '/purchase-orders' && request.method === 'POST') {
+      return handleCreatePurchaseOrder(request, effectiveEnv)
     }
 
     if (url.pathname === '/nota' && request.method === 'GET') {
