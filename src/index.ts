@@ -2070,10 +2070,21 @@ async function handleUploadPaymentEvidence(
 }
 
 async function handleGetPaymentEvidence(
-  _request: Request,
+  request: Request,
   env: Env,
   paymentId: number,
 ): Promise<Response> {
+  // Opened via a plain <a href> (new tab / image src), not apiFetch, so it
+  // can't carry an Authorization header -- the frontend appends the token
+  // as a query param instead. Still required either way: this used to skip
+  // auth entirely, letting anyone with the link (payment IDs are small
+  // sequential ints) pull any payment's evidence file straight from R2.
+  const queryToken = new URL(request.url).searchParams.get('token')
+  const token = getBearerToken(request) ?? queryToken
+  if (!token || !(await verifySession(token, env.JWT_SECRET))) {
+    return json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
   const payment = await env.DB.prepare('SELECT evidence_key FROM payment WHERE payment_id = ?')
     .bind(paymentId)
     .first<{ evidence_key: string | null }>()
